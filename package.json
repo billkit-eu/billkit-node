@@ -1,0 +1,66 @@
+{
+  "name": "@billkit-eu/sdk",
+  "version": "0.2.2",
+  "description": "Official Node.js SDK for BillKit: a Stripe-Billing-shape multi-tenant SaaS API on Mollie.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests",
+    "prepublishOnly": "npm run build && npm run test && npm run typecheck"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "billkit",
+    "billing",
+    "subscriptions",
+    "mollie",
+    "stripe",
+    "saas"
+  ],
+  "author": "BillKit",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billkit-eu/billkit-node.git"
+  },
+  "homepage": "https://github.com/billkit-eu/billkit-node#readme",
+  "bugs": {
+    "url": "https://github.com/billkit-eu/billkit-node/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
+    "@typescript-eslint/parser": "^8.20.0",
+    "eslint": "^10.8.1",
+    "msw": "^2.15.0",
+    "tsup": "^8.3.5",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "sideEffects": false
+}
