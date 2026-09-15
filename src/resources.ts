@@ -898,7 +898,7 @@ export class WebhookEndpoints extends BaseResource {
     return this.del<T>(`/v1/webhook_endpoints/${id}`, params);
   }
 
-  /** Rotate the signing secret. The new `whsec_...` is returned once. */
+  /** Rotate the signing secret. The new `bkwhsec_...` is returned once. */
   rotateSecret<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
     return this.postEmpty<T>(`/v1/webhook_endpoints/${id}/rotate_secret`, params);
   }

@@ -193,7 +193,7 @@ for await (const row of client.auditLogs.iter({ actor_id: "act_1" })) {
 import { BillKit } from "@billkit-eu/sdk";
 
 const client = new BillKit({
-  apiKey: "sk_test_...",                  // or set BILLKIT_API_KEY
+  apiKey: "bk_test_...",                  // or set BILLKIT_API_KEY
   baseUrl: "https://api.billkit.eu",   // override for self-hosted
   timeoutMs: 30_000,
   retryPolicy: {
@@ -259,7 +259,7 @@ The status is the field the API cannot get wrong. Requests that never reach a ro
 The SDK is **silent by default**. It ships no logger, no transport and no destination, so it can't take over your application's output because it never picks one. Hand it a logger to opt in:
 
 ```ts
-const client = new BillKit({ apiKey: "sk_test_...", logger: console });
+const client = new BillKit({ apiKey: "bk_test_...", logger: console });
 ```
 
 ```
@@ -285,7 +285,7 @@ If your logger takes context first, wrap it:
 
 ```ts
 const client = new BillKit({
-  apiKey: "sk_test_...",
+  apiKey: "bk_test_...",
   logger: {
     debug: (m, c) => pino.debug(c, m),
     warn: (m, c) => pino.warn(c, m),

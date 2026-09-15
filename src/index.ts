@@ -6,7 +6,7 @@
  * ```ts
  * import { BillKit } from "@billkit-eu/sdk";
  *
- * const client = new BillKit({ apiKey: "sk_test_..." });
+ * const client = new BillKit({ apiKey: "bk_test_..." });
  * const customer = await client.customers.create<{ id: string }>({
  *   email: "ada@example.com",
  * });
@@ -45,7 +45,7 @@
  * a logger to opt in:
  *
  * ```ts
- * const client = new BillKit({ apiKey: "sk_test_...", logger: console });
+ * const client = new BillKit({ apiKey: "bk_test_...", logger: console });
  * ```
  *
  * See {@link BillKitLogger} for what is logged and what is withheld
