@@ -79,6 +79,7 @@ export type {
   CreateProductParams,
   CreateRefundParams,
   CreateTaxRateParams,
+  CreateUsageRecordParams,
   CreateWebhookEndpointParams,
   EventsListParams,
   IdempotencyOptions,
@@ -86,11 +87,13 @@ export type {
   PricesListParams,
   RotateProviderCredentialParams,
   SetPortalBrandingParams,
+  SubscriptionsListParams,
   UpdateCouponParams,
   UpdateCustomerParams,
   UpdateProductParams,
   UpdateTaxRateParams,
   UpdateWebhookEndpointParams,
+  UsageRecordsListParams,
   ValidateCouponParams,
 } from "./resources.js";
 export { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./retry.js";

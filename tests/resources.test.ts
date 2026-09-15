@@ -13,6 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import { BillKit } from "../src/client.js";
+import { ServerError } from "../src/errors.js";
 import { FAST_RETRY, makeMockFetch } from "./helpers.js";
 
 function client(fetchImpl: typeof fetch) {
@@ -116,6 +117,47 @@ describe("Invoices, Payments, AuditLogs (read-only)", () => {
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "in_1" } }]);
     await client(fetchImpl).invoices.retrieve("in_1");
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/invoices/in_1");
+  });
+
+  it("Invoices.retrievePdf GETs /pdf and hands back the raw bytes", async () => {
+    // Not `makeMockFetch`: that helper JSON-stringifies every staged
+    // body, and the point of this path is that the bytes are *not* JSON.
+    const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37]); // "%PDF-1.7"
+    const calls: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      calls.push(input.toString());
+      return new Response(pdf, {
+        status: 200,
+        headers: { "content-type": "application/pdf" },
+      });
+    };
+
+    const bytes = await client(fetchImpl).invoices.retrievePdf("in_1");
+
+    expect(calls[0]).toBe("https://test.billkit.eu/v1/invoices/in_1/pdf");
+    expect(bytes).toBeInstanceOf(ArrayBuffer);
+    expect(new TextDecoder().decode(bytes)).toBe("%PDF-1.7");
+  });
+
+  it("Invoices.retrievePdf still raises the typed error envelope", async () => {
+    // `INVOICE_PDF_ENABLED=false` answers 501 with the normal envelope;
+    // the binary path must decode that rather than hand back bytes.
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: { type: "api_error", code: "rendering_pending", message: "off" },
+        }),
+        { status: 501, headers: { "content-type": "application/json" } },
+      );
+
+    try {
+      await client(fetchImpl).invoices.retrievePdf("in_1");
+      expect.fail("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ServerError);
+      expect((err as ServerError).code).toBe("rendering_pending");
+      expect((err as ServerError).statusCode).toBe(501);
+    }
   });
 
   it("Payments.list maps to /v1/payments", async () => {
@@ -255,6 +297,23 @@ describe("CheckoutSessions: 0.2 body shape", () => {
     expect(body.customer_name).toBe("Ada Lovelace");
     expect("customer_id" in body).toBe(false);
   });
+
+  it("forwards ui_mode + metadata so the embedded element is reachable", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "cs_1", client_secret: "cs_1_secret_abc" } },
+    ]);
+    await client(fetchImpl).checkoutSessions.create({
+      customer_email: "ada@example.com",
+      price_id: "price_1",
+      success_url: "https://app.example.com/ok",
+      cancel_url: "https://app.example.com/no",
+      ui_mode: "embedded",
+      metadata: { order_id: "ord_42" },
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body.ui_mode).toBe("embedded");
+    expect(body.metadata).toEqual({ order_id: "ord_42" });
+  });
 });
 
 describe("OneShotPayments", () => {
@@ -336,6 +395,97 @@ describe("Subscriptions: reactivate", () => {
   });
 });
 
+describe("Subscriptions: usage records", () => {
+  it("createUsageRecord posts to the nested route with the usage fields", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 201,
+        body: {
+          id: "ur_1",
+          object: "usage_record",
+          subscription_id: "sub_1",
+          quantity: 42,
+          invoice_id: null,
+        },
+      },
+    ]);
+    await client(fetchImpl).subscriptions.createUsageRecord("sub_1", {
+      quantity: 42,
+      occurred_at: 1_700_000_000,
+      metadata: { source: "unit" },
+    });
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records");
+    expect(calls[0]?.method).toBe("POST");
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body).toEqual({
+      quantity: 42,
+      occurred_at: 1_700_000_000,
+      metadata: { source: "unit" },
+    });
+    // Auto-idempotency wraps the mutating call; usage reporting is
+    // exactly the surface where a double-send must not double-bill.
+    expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
+  });
+
+  it("createUsageRecord threads a caller-supplied idempotency key and omits optionals", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 201, body: { id: "ur_1", object: "usage_record" } },
+    ]);
+    await client(fetchImpl).subscriptions.createUsageRecord("sub_1", {
+      quantity: 1,
+      idempotencyKey: "usage-1",
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body).toEqual({ quantity: 1 });
+    expect("idempotencyKey" in body).toBe(false);
+    expect(calls[0]?.headers["idempotency-key"]).toBe("usage-1");
+  });
+
+  it("listUsageRecords GETs the nested route with the invoice_id filter", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).subscriptions.listUsageRecords("sub_1", {
+      invoice_id: "pending",
+      limit: 25,
+    });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(url.pathname).toBe("/v1/subscriptions/sub_1/usage_records");
+    expect(url.searchParams.get("invoice_id")).toBe("pending");
+    expect(url.searchParams.get("limit")).toBe("25");
+    expect(calls[0]?.method).toBe("GET");
+  });
+});
+
+describe("Prices: usage_type", () => {
+  it("carries usage_type in the create body", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", usage_type: "metered" } },
+    ]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_api",
+      amount_cents: 5,
+      currency: "EUR",
+      interval: "month",
+      usage_type: "metered",
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body.usage_type).toBe("metered");
+  });
+
+  it("omits usage_type when undefined (server defaults to licensed)", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_1",
+      amount_cents: 999,
+      currency: "EUR",
+      interval: "month",
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect("usage_type" in body).toBe(false);
+  });
+});
+
 describe("Prices: refund window override", () => {
   it("carries refund_window_initial_days and renewal in the create body", async () => {
     const { fetchImpl, calls } = makeMockFetch([
@@ -409,5 +559,132 @@ describe("WebhookEndpoints deliveries", () => {
     );
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.headers["idempotency-key"]).toBe("redeliver-1");
+  });
+});
+
+describe("Prices: archive", () => {
+  it("update POSTs active:false to /v1/prices/{id} and carries the idempotency key", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", active: false } },
+    ]);
+    const archived = await client(fetchImpl).prices.update<{ id: string; active: boolean }>(
+      "price_1",
+      { active: false, idempotencyKey: "archive-1" },
+    );
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/prices/price_1");
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.headers["idempotency-key"]).toBe("archive-1");
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ active: false });
+    expect(archived.active).toBe(false);
+  });
+
+  it("auto-generates an idempotency key when none is supplied", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await client(fetchImpl).prices.update("price_1", { active: false });
+    expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
+  });
+
+  // `active` moves both ways. It decides what new checkouts may buy and
+  // nothing else, so neither direction can change what a past charge was
+  // made under, which is what price immutability actually protects.
+  it("sends active:true to put a price back on sale", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", active: true } },
+    ]);
+    const back = await client(fetchImpl).prices.update<{ active: boolean }>("price_1", {
+      active: true,
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ active: true });
+    expect(back.active).toBe(true);
+  });
+});
+
+describe("DELETE is only for resources that really go away", () => {
+  // The catalogue is retired through its update route. The SDK used to
+  // carry a `delete()` for each of those, which named a verb the server
+  // no longer answers and described an outcome that never happened:
+  // every one of those rows stays readable afterwards.
+  it("is not exposed on the catalogue resources", () => {
+    const c = client(makeMockFetch([]).fetchImpl) as unknown as Record<string, unknown>;
+    for (const resource of ["prices", "products", "coupons", "taxRates"]) {
+      const target = c[resource] as Record<string, unknown>;
+      expect(target.delete, `${resource}.delete should not exist`).toBeUndefined();
+      expect(typeof target.update).toBe("function");
+    }
+  });
+
+  it("is exposed where the object does go away", () => {
+    const c = client(makeMockFetch([]).fetchImpl);
+    expect(typeof c.customers.delete).toBe("function");
+    // A webhook endpoint is configuration, not a record of money, so a
+    // mistyped URL is removed rather than disabled forever. Disabling
+    // stays beside it as the reversible act.
+    expect(typeof c.webhookEndpoints.delete).toBe("function");
+    expect(typeof c.webhookEndpoints.update).toBe("function");
+  });
+
+  it("sends DELETE to the webhook endpoint path", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "we_1", object: "webhook_endpoint", deleted: true } },
+    ]);
+    const gone = await client(fetchImpl).webhookEndpoints.delete<{ deleted: boolean }>("we_1", {
+      idempotencyKey: "drop-1",
+    });
+    expect(calls[0]?.method).toBe("DELETE");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/webhook_endpoints/we_1");
+    expect(calls[0]?.headers["idempotency-key"]).toBe("drop-1");
+    expect(gone.deleted).toBe(true);
+  });
+});
+
+describe("Subscriptions: list filters", () => {
+  it("sends renewal_state, the only way to find paused subscriptions", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).subscriptions.list({ renewal_state: "paused" });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(url.pathname).toBe("/v1/subscriptions");
+    expect(url.searchParams.get("renewal_state")).toBe("paused");
+    expect(url.searchParams.has("status")).toBe(false);
+    expect(calls[0]?.method).toBe("GET");
+  });
+
+  it("sends customer_id and a CSV status together", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).subscriptions.list({
+      customer_id: "cus_1",
+      status: "active,past_due",
+      limit: 25,
+    });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(url.searchParams.get("customer_id")).toBe("cus_1");
+    expect(url.searchParams.get("status")).toBe("active,past_due");
+    expect(url.searchParams.get("limit")).toBe("25");
+  });
+
+  it("iter carries the filter onto every page request", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 200,
+        body: { object: "list", data: [{ id: "sub_1" }], has_more: true },
+      },
+      { status: 200, body: { object: "list", data: [{ id: "sub_2" }], has_more: false } },
+    ]);
+    const seen: string[] = [];
+    for await (const sub of client(fetchImpl).subscriptions.iter<{ id: string }>({
+      renewal_state: "paused",
+      pageSize: 1,
+    })) {
+      seen.push(sub.id);
+    }
+    expect(seen).toEqual(["sub_1", "sub_2"]);
+    for (const call of calls) {
+      expect(new URL(call.url).searchParams.get("renewal_state")).toBe("paused");
+    }
+    // Page 2 still carries the cursor as well as the filter.
+    expect(new URL(calls[1]?.url ?? "").searchParams.get("starting_after")).toBe("sub_1");
   });
 });

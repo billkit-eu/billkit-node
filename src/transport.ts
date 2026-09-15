@@ -33,6 +33,14 @@ export interface RequestOptions {
   body?: Record<string, unknown> | undefined;
   idempotencyKey?: string | undefined;
   extraHeaders?: Record<string, string>;
+  /**
+   * How to read a **successful** response body. `"json"` (the default)
+   * parses it; `"binary"` hands back the raw `ArrayBuffer`, for
+   * endpoints that serve a document rather than a resource (the invoice
+   * PDF). Error responses are always read as JSON either way, so the
+   * typed error hierarchy behaves identically on both paths.
+   */
+  responseType?: "json" | "binary";
 }
 
 export interface TransportConfig {
@@ -126,14 +134,39 @@ function buildHeaders(
   return headers;
 }
 
-async function parseJson(response: Response): Promise<unknown> {
-  const text = await response.text();
+function parseJsonText(text: string): unknown {
   if (!text) return null;
   try {
     return JSON.parse(text);
   } catch {
     return null;
   }
+}
+
+async function parseJson(response: Response): Promise<unknown> {
+  return parseJsonText(await response.text());
+}
+
+/**
+ * Read the body once, as the caller asked for it.
+ *
+ * A `Response` body can only be consumed once, so the choice has to be
+ * made here rather than after the status check. On the binary path a
+ * *failed* response is still decoded as UTF-8 JSON: an error is an error
+ * envelope no matter which endpoint produced it, and losing that would
+ * mean the PDF call throwing a shapeless error where every other call
+ * throws a typed one.
+ */
+async function readBody(
+  response: Response,
+  responseType: "json" | "binary",
+): Promise<{ parsed: unknown; binary: ArrayBuffer | undefined }> {
+  if (responseType !== "binary") {
+    return { parsed: await parseJson(response), binary: undefined };
+  }
+  const buffer = await response.arrayBuffer();
+  if (response.ok) return { parsed: null, binary: buffer };
+  return { parsed: parseJsonText(new TextDecoder().decode(buffer)), binary: undefined };
 }
 
 function parseRetryAfterMs(header: string | null): number | undefined {
@@ -198,7 +231,22 @@ export class Transport {
     this.fetchFn = fetchFn.bind(globalThis);
   }
 
+  /**
+   * Fetch a binary document (currently only the invoice PDF).
+   *
+   * Same retry policy, same timeout, same typed errors as
+   * {@link Transport.request}; only the success-path decoding differs.
+   * `fetch` follows the storage adapter's `302` to the signed URL by
+   * itself, and the WHATWG spec drops the `Authorization` header on that
+   * cross-origin hop — which is correct, since a presigned URL carries
+   * its own credential and must not be handed BillKit's API key.
+   */
+  requestBinary(options: Omit<RequestOptions, "responseType">): Promise<ArrayBuffer> {
+    return this.request<ArrayBuffer>({ ...options, responseType: "binary" });
+  }
+
   async request<T = unknown>(options: RequestOptions): Promise<T> {
+    const responseType = options.responseType ?? "json";
     const idempotencyKey = autoIdempotencyKey(options.method, options.idempotencyKey);
     const url = buildUrl(this.baseUrl, options.path, options.query);
     const headers = buildHeaders(
@@ -222,6 +270,7 @@ export class Transport {
       const startedAt = Date.now();
       let response: Response;
       let parsedBody: unknown;
+      let binaryBody: ArrayBuffer | undefined;
       try {
         // ``body`` is only spread when present so a GET request goes
         // out without a body field. Some hosts (Cloudflare Workers'
@@ -240,7 +289,7 @@ export class Transport {
         };
         if (body !== undefined) init.body = body;
         response = await this.fetchFn(url, init);
-        parsedBody = await parseJson(response);
+        ({ parsed: parsedBody, binary: binaryBody } = await readBody(response, responseType));
       } catch (err) {
         lastError = connectionError(err, this.timeoutMs);
         if (!shouldRetry(null, attempt, this.retryPolicy)) throw lastError;
@@ -267,6 +316,7 @@ export class Transport {
       });
 
       if (response.ok) {
+        if (responseType === "binary") return binaryBody as T;
         return (parsedBody ?? undefined) as T;
       }
 
@@ -278,7 +328,11 @@ export class Transport {
         retryAfter: retryAfterMs === undefined ? undefined : retryAfterMs / 1000,
       });
 
-      if (!shouldRetry(response.status, attempt, this.retryPolicy, retryAfterMs)) {
+      // `error.code` is what separates a transient
+      // `409 idempotency_in_progress` from every other (permanent) 409;
+      // see `IN_PROGRESS_CODE`. The key on the wire is unchanged across
+      // attempts, so the retry replays rather than re-charges.
+      if (!shouldRetry(response.status, attempt, this.retryPolicy, retryAfterMs, error.code)) {
         throw error;
       }
       lastError = error;

@@ -34,7 +34,10 @@ import type { QueryValue, Transport } from "./transport.js";
 export interface BaseListParams {
   limit?: number;
   starting_after?: string;
-  ending_before?: string;
+  // Deliberately no `ending_before`: BillKit's cursor pagination binds
+  // `limit` + `starting_after` only (see `api/billkit/api/pagination.py`).
+  // Advertising a backwards cursor the server ignores is worse than not
+  // having one — the request succeeds and silently re-serves page 1.
   readonly [key: string]: QueryValue;
 }
 
@@ -46,6 +49,27 @@ export interface BaseListParams {
  */
 export interface PricesListParams extends BaseListParams {
   product_id?: string;
+}
+
+/**
+ * `subscriptions.list` params. Both filters take a comma-separated
+ * list (`"active,past_due"`); an unrecognised value is rejected with
+ * `400 parameter_invalid` rather than silently ignored.
+ *
+ * The two answer different questions, and mixing them up is the most
+ * common mistake against this route. `status` is where the subscription
+ * stands with its payments. `renewal_state` is what happens at the end
+ * of the current period. A paused subscription keeps `status: "active"`,
+ * because the customer has paid for the period they are in, so
+ * `renewal_state: "paused"` is the only way to find paused ones —
+ * `status: "paused"` is not an accepted value and is rejected.
+ */
+export interface SubscriptionsListParams extends BaseListParams {
+  customer_id?: string;
+  /** `incomplete` | `trialing` | `active` | `past_due` | `canceled`, CSV. */
+  status?: string;
+  /** `auto_renew` | `paused` | `canceling` | `stopped`, CSV. */
+  renewal_state?: string;
 }
 
 /** Optional idempotency knob carried by every mutating call. */
@@ -125,6 +149,16 @@ export interface UpdateProductParams extends IdempotencyOptions {
   active?: boolean;
 }
 
+/**
+ * Body for `POST /v1/prices/{id}`. `active` is the only field a price
+ * accepts, and it moves both ways: `false` withdraws the price from sale,
+ * `true` puts it back. The amount, currency and interval are fixed at
+ * creation, so neither direction changes what anyone was charged.
+ */
+export interface UpdatePriceParams extends IdempotencyOptions {
+  active: boolean;
+}
+
 export interface CreatePriceParams extends IdempotencyOptions {
   /** Existing Product id returned from `client.products.create`. */
   product_id: string;
@@ -153,6 +187,44 @@ export interface CreatePriceParams extends IdempotencyOptions {
    * regardless of what tax rates exist now or later.
    */
   tax_behavior?: "inclusive" | "exclusive" | "unspecified";
+  /**
+   * `"licensed"` (the default when omitted) bills `amount_cents` per
+   * period regardless of consumption. `"metered"` bills
+   * `amount_cents` **per reported unit**: post consumption with
+   * `subscriptions.createUsageRecord` and the renewal invoice charges
+   * `amount_cents × sum(quantity)` for the period. Metered prices
+   * must be `interval: "month"`, carry `amount_cents > 0`, and cannot
+   * have `trial_days`.
+   */
+  usage_type?: "licensed" | "metered";
+}
+
+/**
+ * Body for `POST /v1/subscriptions/{id}/usage_records`. Only valid
+ * against a subscription whose price is `usage_type: "metered"`; the
+ * server rejects a licensed subscription with `400 parameter_invalid`.
+ */
+export interface CreateUsageRecordParams extends IdempotencyOptions {
+  /** Units consumed, `1..1_000_000`. Post multiple records to accumulate. */
+  quantity: number;
+  /**
+   * Epoch seconds when the consumption happened. Omit to let the
+   * server stamp receipt time. Useful when reporting is batched and
+   * the record must land in the period the usage occurred.
+   */
+  occurred_at?: number;
+  /** Small string metadata map echoed back on the record. */
+  metadata?: Record<string, string>;
+}
+
+/**
+ * `subscriptions.listUsageRecords` params. `invoice_id` filters by
+ * billing state: `"pending"` selects records not yet rolled into an
+ * invoice, and a concrete `inv_...` id selects the records that
+ * invoice billed. Omit it to list everything.
+ */
+export interface UsageRecordsListParams extends BaseListParams {
+  invoice_id?: "pending" | (string & {});
 }
 
 export interface CreateCheckoutSessionParams extends IdempotencyOptions {
@@ -191,6 +263,19 @@ export interface CreateCheckoutSessionParams extends IdempotencyOptions {
    * `0` disables a trial that the price would otherwise grant.
    */
   trial_days_override?: number;
+  /**
+   * `"hosted"` (the default) returns a `url` you redirect the buyer to.
+   * `"embedded"` returns a `client_secret` instead, for
+   * `mountCheckoutElement()` / `<CheckoutElement/>` from
+   * `@billkit-eu/js` — the card fields then render in a cross-origin
+   * iframe on your own page.
+   */
+  ui_mode?: "hosted" | "embedded";
+  /**
+   * Small string map carried onto the session. Up to 50 keys, key ≤ 40
+   * chars, value ≤ 500 chars.
+   */
+  metadata?: Record<string, string>;
 }
 
 export interface CreateRefundParams extends IdempotencyOptions {
@@ -451,6 +536,16 @@ export class Customers extends BaseResource {
     return this.post<T, UpdateCustomerParams>(`/v1/customers/${id}`, params);
   }
 
+  /**
+   * Delete a customer. Resolves to `{ id, object: "customer", deleted:
+   * true }`, not the customer.
+   *
+   * The customer leaves the API: `retrieve()` 404s and they drop out of
+   * `list()`. Their payments, invoices and refunds are untouched, and so
+   * is their personal data — use {@link Customers.purge} for a GDPR
+   * erasure. Refused while they hold a subscription that can still
+   * charge them.
+   */
   delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
     return this.del<T>(`/v1/customers/${id}`, params);
   }
@@ -497,14 +592,17 @@ export class Products extends BaseResource {
     return this.get<T>(`/v1/products/${id}`);
   }
 
-  /** Patch mutable Product fields. */
+  /**
+   * Patch mutable Product fields, or archive it with `active: false`.
+   *
+   * Archiving is how you stop offering something. The product keeps its
+   * id and still comes back from `retrieve()` and `list()`, because what
+   * was sold under it has to stay readable, so there is no `delete()`.
+   * A checkout against any of its prices is refused from then on, and
+   * `active: true` un-archives.
+   */
   update<T = unknown>(id: string, params: UpdateProductParams): Promise<T> {
     return this.post<T, UpdateProductParams>(`/v1/products/${id}`, params);
-  }
-
-  /** Archive a Product. */
-  delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/products/${id}`, params);
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -524,6 +622,30 @@ export class Prices extends BaseResource {
 
   retrieve<T = unknown>(id: string): Promise<T> {
     return this.get<T>(`/v1/prices/${id}`);
+  }
+
+  /**
+   * Archive a Price so it stops selling, or put it back on sale.
+   *
+   * `update(id, { active: false })` archives. The price keeps its id and
+   * is still returned by `retrieve()` and by `list()`, because
+   * subscriptions renew against it by id and what they are charged has to
+   * stay readable. Subscriptions already on it keep renewing at it. What
+   * stops is new business: a checkout session against the price is
+   * refused and it is no longer offered as a plan change.
+   *
+   * `{ active: true }` undoes that. `active` is the only field because
+   * `amount_cents`, `currency` and `interval` are fixed at creation, and
+   * since none of them move here neither direction can change what a past
+   * charge was made under. To charge something different, create a new
+   * price.
+   *
+   * Sending the value a price already has returns it unchanged and emits
+   * no second event, so a retry is safe. Archiving emits
+   * `price.archived`; putting one back emits `price.updated`.
+   */
+  update<T = unknown>(id: string, params: UpdatePriceParams): Promise<T> {
+    return this.post<T, UpdatePriceParams>(`/v1/prices/${id}`, params);
   }
 
   list<T = unknown>(params: PricesListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -575,12 +697,33 @@ export class Subscriptions extends BaseResource {
     return this.get<T>(`/v1/subscriptions/${id}`);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  /**
+   * List subscriptions, newest first, optionally filtered.
+   *
+   * Reach for `renewal_state: "paused"` rather than `status: "paused"`
+   * to find paused subscriptions; see `SubscriptionsListParams`.
+   */
+  list<T = unknown>(params: SubscriptionsListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/subscriptions", params);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/subscriptions", p), { pageSize: options.pageSize });
+  /**
+   * Walk every page of `list()`. Filters are carried onto each page
+   * request, so a filtered walk narrows server-side instead of paging
+   * the whole history and discarding rows client-side.
+   */
+  iter<T = unknown>(
+    options: {
+      pageSize?: number;
+      customer_id?: string;
+      status?: string;
+      renewal_state?: string;
+    } = {},
+  ): AsyncIterableIterator<T> {
+    // `undefined` query values are pruned by the transport, so the
+    // filter can be spread as-is without a conditional per key.
+    const { pageSize, ...filter } = options;
+    return paginate<T>((p) => this.get("/v1/subscriptions", { ...filter, ...p }), { pageSize });
   }
 
   cancel<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
@@ -634,6 +777,48 @@ export class Subscriptions extends BaseResource {
       { idempotencyKey: params.idempotencyKey },
     );
   }
+
+  /**
+   * Report consumption against a metered subscription.
+   *
+   * Only valid when the subscription's price is `usage_type:
+   * "metered"`; a licensed subscription is rejected with `400
+   * parameter_invalid`. Records accumulate until the renewal invoice
+   * rolls them up (`amount_cents × sum(quantity)`); the record's
+   * `invoice_id` stays `null` until then.
+   *
+   * Supports `Idempotency-Key` replay: retrying with the same key
+   * returns the same record instead of double-counting the usage,
+   * which is what makes at-least-once reporting pipelines safe.
+   */
+  createUsageRecord<T = unknown>(id: string, params: CreateUsageRecordParams): Promise<T> {
+    return this.post<T, CreateUsageRecordParams>(`/v1/subscriptions/${id}/usage_records`, params);
+  }
+
+  /**
+   * List usage records for one subscription.
+   *
+   * Pass `invoice_id: "pending"` to reconcile what has been reported
+   * but not yet billed, or a concrete invoice id to see what that
+   * invoice charged for.
+   */
+  listUsageRecords<T = unknown>(
+    id: string,
+    params: UsageRecordsListParams = {},
+  ): Promise<ListResponseEnvelope<T>> {
+    return this.get<ListResponseEnvelope<T>>(`/v1/subscriptions/${id}/usage_records`, params);
+  }
+
+  /** Walk every page of `listUsageRecords()` for one subscription. */
+  iterUsageRecords<T = unknown>(
+    id: string,
+    options: { pageSize?: number; invoice_id?: string } = {},
+  ): AsyncIterableIterator<T> {
+    return paginate<T>((p) => this.get(`/v1/subscriptions/${id}/usage_records`, p), {
+      pageSize: options.pageSize,
+      filters: { invoice_id: options.invoice_id },
+    });
+  }
 }
 
 export class Refunds extends BaseResource {
@@ -686,10 +871,29 @@ export class WebhookEndpoints extends BaseResource {
     return this.get<T>(`/v1/webhook_endpoints/${id}`);
   }
 
+  /**
+   * Update an endpoint, or stop delivery with `status: "disabled"`.
+   *
+   * Disabling keeps the endpoint, its signing secret and its delivery
+   * history, and `status: "enabled"` resumes. Use {@link
+   * WebhookEndpoints.delete} when the endpoint should not exist at all:
+   * disabling is reversible and deleting is not.
+   */
   update<T = unknown>(id: string, params: UpdateWebhookEndpointParams): Promise<T> {
     return this.post<T, UpdateWebhookEndpointParams>(`/v1/webhook_endpoints/${id}`, params);
   }
 
+  /**
+   * Delete an endpoint. Resolves to `{ id, object: "webhook_endpoint",
+   * deleted: true }`, not the endpoint.
+   *
+   * A URL registered by mistake should not be a permanent fixture of the
+   * account, so this removes it: `retrieve()` 404s afterwards and it is
+   * gone from `list()`. Its delivery attempts go with it, because they
+   * are readable only through the endpoint that owns them. The events
+   * themselves are untouched and still in `client.events`, so what you
+   * were sent stays on record.
+   */
   delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
     return this.del<T>(`/v1/webhook_endpoints/${id}`, params);
   }
@@ -834,12 +1038,16 @@ export class Coupons extends BaseResource {
     return this.get<T>(`/v1/coupons/${id}`);
   }
 
+  /**
+   * Update a coupon's limits, or withdraw it with `active: false`.
+   *
+   * A withdrawn code is refused at checkout while the coupon stays
+   * readable and discounts already applied keep working out, so there is
+   * no `delete()`: a coupon that has been redeemed is part of what a
+   * customer was charged. `active: true` brings the campaign back.
+   */
   update<T = unknown>(id: string, params: UpdateCouponParams): Promise<T> {
     return this.post<T, UpdateCouponParams>(`/v1/coupons/${id}`, params);
-  }
-
-  delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/coupons/${id}`, params);
   }
 
   /**
@@ -876,12 +1084,16 @@ export class TaxRates extends BaseResource {
     return this.get<T>(`/v1/tax_rates/${id}`);
   }
 
+  /**
+   * Correct a rate, retire it with `active: false`, or bring one back.
+   *
+   * Retiring is how you stop charging VAT in a country. The rate stays
+   * readable, because an invoice records the percentage it charged and
+   * you have to be able to point at the rate that produced it, so there
+   * is no `delete()`.
+   */
   update<T = unknown>(id: string, params: UpdateTaxRateParams): Promise<T> {
     return this.post<T, UpdateTaxRateParams>(`/v1/tax_rates/${id}`, params);
-  }
-
-  delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/tax_rates/${id}`, params);
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -897,13 +1109,34 @@ export class TaxRates extends BaseResource {
  * Read-only access to generated invoices.
  *
  * Invoices are produced by the billing pipeline; tenants don't create
- * them directly. PDF retrieval returns a 302 redirect to the storage
- * adapter's signed URL. Follow it transparently with the runtime's
- * fetch settings.
+ * them directly. Fetch the rendered document with
+ * {@link Invoices.retrievePdf}.
  */
 export class Invoices extends BaseResource {
   retrieve<T = unknown>(id: string): Promise<T> {
     return this.get<T>(`/v1/invoices/${id}`);
+  }
+
+  /**
+   * Download the rendered invoice PDF as raw bytes.
+   *
+   * ```ts
+   * const pdf = await client.invoices.retrievePdf("inv_123");
+   * await writeFile("invoice.pdf", Buffer.from(pdf));
+   * ```
+   *
+   * Blob-backed deployments stream the bytes inline; S3-backed ones
+   * answer `302` to a presigned URL, which `fetch` follows for us under
+   * the SDK's own timeout and retry policy — so both storage adapters
+   * look identical from here.
+   *
+   * Deployments with `INVOICE_PDF_ENABLED=false` never render one and
+   * answer `501 rendering_pending`, which surfaces as a `ServerError`
+   * whose `code` is `"rendering_pending"`; `retrieve()` still returns the
+   * structured invoice for tenants who render their own.
+   */
+  retrievePdf(id: string): Promise<ArrayBuffer> {
+    return this.t.requestBinary({ method: "GET", path: `/v1/invoices/${id}/pdf` });
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {

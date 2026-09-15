@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { BillKit } from "../src/client.js";
-import { AuthenticationError, RateLimitError, ServerError } from "../src/errors.js";
+import {
+  AuthenticationError,
+  ConflictError,
+  RateLimitError,
+  ServerError,
+} from "../src/errors.js";
 import { FAST_RETRY, makeMockFetch } from "./helpers.js";
 
 describe("retry", () => {
@@ -102,6 +107,84 @@ describe("retry", () => {
       RateLimitError,
     );
     expect(calls).toHaveLength(1);
+  });
+
+  it("retries 409 idempotency_in_progress then returns the replayed result", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 409,
+        headers: { "Retry-After": "1" },
+        body: {
+          error: {
+            type: "conflict",
+            code: "idempotency_in_progress",
+            message: "A request with the same Idempotency-Key is currently in progress.",
+          },
+        },
+      },
+      { status: 200, body: { id: "cus_1" } },
+    ]);
+    const client = new BillKit({
+      apiKey: "sk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: FAST_RETRY,
+      fetch: fetchImpl,
+    });
+
+    const customer = await client.customers.create<{ id: string }>({ email: "a@b.co" });
+
+    expect(customer.id).toBe("cus_1");
+    expect(calls).toHaveLength(2);
+    // The whole reason retrying is safe: same key, so the second call is
+    // a replay of the first rather than a second charge.
+    expect(calls[0]?.headers["idempotency-key"]).toBe(calls[1]?.headers["idempotency-key"]);
+  });
+
+  it("does not retry a 409 with any other code", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 409,
+        body: {
+          error: {
+            type: "conflict",
+            code: "idempotency_key_in_use",
+            message: "different body",
+          },
+        },
+      },
+    ]);
+    const client = new BillKit({
+      apiKey: "sk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: FAST_RETRY,
+      fetch: fetchImpl,
+    });
+
+    await expect(client.customers.create({ email: "a@b.co" })).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it("bounds idempotency_in_progress retries by maxAttempts", async () => {
+    const inProgress = {
+      status: 409,
+      body: {
+        error: { type: "conflict", code: "idempotency_in_progress", message: "in flight" },
+      },
+    };
+    const { fetchImpl, calls } = makeMockFetch([inProgress, inProgress, inProgress]);
+    const client = new BillKit({
+      apiKey: "sk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: FAST_RETRY,
+      fetch: fetchImpl,
+    });
+
+    await expect(client.customers.create({ email: "a@b.co" })).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    expect(calls).toHaveLength(FAST_RETRY.maxAttempts);
   });
 
   it("Idempotency-Key is stable across retries", async () => {
