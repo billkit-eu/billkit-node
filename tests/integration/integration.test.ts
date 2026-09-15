@@ -55,17 +55,40 @@ let client: BillKit;
 /** A product + price pair the money specs charge against. */
 async function makePlan(
   c: BillKit,
-  opts: { amountCents?: number; interval?: "month" | "year"; trialDays?: number } = {},
+  opts: {
+    amountCents?: number;
+    interval?: "month" | "year";
+    trialDays?: number;
+    usageType?: "licensed" | "metered";
+  } = {},
 ) {
   const product = await c.products.create<{ id: string }>({ name: `Plan ${idemKey()}` });
-  const price = await c.prices.create<{ id: string; amount_cents: number }>({
+  const price = await c.prices.create<{ id: string; amount_cents: number; usage_type: string }>({
     product_id: product.id,
     amount_cents: opts.amountCents ?? 2500,
     currency: "EUR",
     interval: opts.interval ?? "month",
     trial_days: opts.trialDays ?? 0,
+    ...(opts.usageType === undefined ? {} : { usage_type: opts.usageType }),
   });
   return { product, price };
+}
+
+/**
+ * Mint an ACTIVE subscription on `priceId` and return it.
+ *
+ * Same machinery as the money specs: checkout -> settle at the fake
+ * Mollie -> deliver the webhook, then find the subscription by price.
+ */
+async function activeSubscription(c: BillKit, t: TestTenant, priceId: string) {
+  await checkoutToActive(c, t, priceId);
+  const subs = await c.subscriptions.list<{
+    data: Array<{ id: string; status: string; price_id: string }>;
+  }>({ limit: 100 });
+  const sub = subs.data.find((s) => s.price_id === priceId);
+  expect(sub, "a subscription should exist for the settled checkout").toBeTruthy();
+  expect(sub!.status).toBe("active");
+  return sub!;
 }
 
 /**
@@ -143,8 +166,12 @@ d("BillKit node SDK against a live API", () => {
       });
       expect(updated.name).toBe("Round Trip v2");
 
-      const deleted = await client.products.delete<{ active: boolean }>(created.id);
-      expect(deleted.active).toBe(false);
+      // Archive is the update route: the product has no delete, because
+      // an archived product stays readable.
+      const archived = await client.products.update<{ active: boolean }>(created.id, {
+        active: false,
+      });
+      expect(archived.active).toBe(false);
     });
 
     scenario("crud.price", "price creates under a product and filters by product_id", async () => {
@@ -160,6 +187,41 @@ d("BillKit node SDK against a live API", () => {
       expect(filtered.data.map((p) => p.id)).toContain(price.id);
     });
 
+    scenario("crud.price_archive", "archiving a price is a readable, repeatable no-op", async () => {
+      const { product, price } = await makePlan(client, { amountCents: 777 });
+
+      const archived = await client.prices.update<{ id: string; active: boolean }>(price.id, {
+        active: false,
+      });
+      expect(archived.id).toBe(price.id);
+      expect(archived.active).toBe(false);
+
+      // Archiving is not a delete: the row survives, so a subscription
+      // that still points at it can be read back rather than dangling.
+      const fetched = await client.prices.retrieve<{ id: string; active: boolean }>(price.id);
+      expect(fetched.active).toBe(false);
+      const listed = await client.prices.list<{ data: Array<{ id: string }> }>({
+        product_id: product.id,
+      });
+      expect(listed.data.map((p) => p.id)).toContain(price.id);
+
+      // Re-archiving returns it unchanged instead of erroring, which is
+      // what makes a retried archive safe.
+      const again = await client.prices.update<{ id: string; active: boolean }>(price.id, {
+        active: false,
+      });
+      expect(again.id).toBe(price.id);
+      expect(again.active).toBe(false);
+
+      // `active` moves both ways, and the money-bearing fields survive the
+      // round trip, which is the immutability claim that actually matters.
+      const back = await client.prices.update<{ active: boolean; amount_cents: number }>(price.id, {
+        active: true,
+      });
+      expect(back.active).toBe(true);
+      expect(back.amount_cents).toBe(777);
+    });
+
     scenario("crud.customer", "customer round-trips and delete removes it from the list", async () => {
       const email = `cust-${idemKey()}@sdk-it.example.com`;
       const created = await client.customers.create<{ id: string; email: string }>({
@@ -173,12 +235,19 @@ d("BillKit node SDK against a live API", () => {
       });
       expect(updated.name).toBe("Ada L.");
 
-      await client.customers.delete(created.id);
+      const deleted = await client.customers.delete<{
+        id: string;
+        object: string;
+        deleted: boolean;
+      }>(created.id);
+      // The customer leaves the API, so the body is a marker, not a row.
+      expect(deleted).toEqual({ id: created.id, object: "customer", deleted: true });
+
       const page = await client.customers.list<{ data: Array<{ id: string }> }>({ limit: 100 });
       expect(page.data.map((c) => c.id)).not.toContain(created.id);
     });
 
-    scenario("crud.coupon", "coupon creates, validates, updates, deletes", async () => {
+    scenario("crud.coupon", "coupon creates, validates, updates, withdraws", async () => {
       const code = `SAVE${Date.now().toString().slice(-8)}`;
       const created = await client.coupons.create<{ id: string; code: string }>({
         code,
@@ -192,12 +261,17 @@ d("BillKit node SDK against a live API", () => {
       expect(validated.valid).toBe(true);
 
       await client.coupons.update(created.id, { max_redemptions: 5 });
-      await client.coupons.delete(created.id);
+      await client.coupons.update(created.id, { active: false });
 
-      // A deleted coupon must stop validating, otherwise a revoked
+      // A withdrawn coupon must stop validating, otherwise a retired
       // discount would keep applying at checkout.
-      const afterDelete = await client.coupons.validate<{ valid: boolean }>({ code });
-      expect(afterDelete.valid).toBe(false);
+      const afterWithdraw = await client.coupons.validate<{ valid: boolean }>({ code });
+      expect(afterWithdraw.valid).toBe(false);
+
+      // ...while staying readable, because a discount already applied to
+      // a live subscription has to be traceable to the coupon behind it.
+      const stillThere = await client.coupons.retrieve<{ active: boolean }>(created.id);
+      expect(stillThere.active).toBe(false);
     });
 
     scenario("crud.tax_rate", "tax rate round-trips", async () => {
@@ -213,7 +287,14 @@ d("BillKit node SDK against a live API", () => {
       });
       expect(updated.rate_basis_points).toBe(900);
 
-      await client.taxRates.delete(created.id);
+      // Retiring is an update, and the rate stays readable: an invoice
+      // records the percentage it charged, not the rate row.
+      const retired = await client.taxRates.update<{ active: boolean }>(created.id, {
+        active: false,
+      });
+      expect(retired.active).toBe(false);
+      const stillReadable = await client.taxRates.retrieve<{ active: boolean }>(created.id);
+      expect(stillReadable.active).toBe(false);
     });
 
     scenario("crud.webhook_endpoint", "endpoint round-trips and rotates its secret", async () => {
@@ -231,8 +312,71 @@ d("BillKit node SDK against a live API", () => {
       expect(rotated.secret).toMatch(/^whsec_/);
       expect(rotated.secret).not.toBe(created.secret);
 
-      await client.webhookEndpoints.delete(created.id);
+      // Disabling stops delivery and keeps everything else, so the
+      // endpoint is still listed and can be turned back on.
+      const disabled = await client.webhookEndpoints.update<{ status: string }>(created.id, {
+        status: "disabled",
+      });
+      expect(disabled.status).toBe("disabled");
+      const page = await client.webhookEndpoints.list<{ data: Array<{ id: string }> }>({
+        limit: 100,
+      });
+      expect(page.data.map((e) => e.id)).toContain(created.id);
+
+      // Deleting is the other act, and it is a real one: a URL registered
+      // by mistake leaves the account rather than sitting there disabled
+      // for good.
+      const gone = await client.webhookEndpoints.delete<{ id: string; deleted: boolean }>(
+        created.id,
+      );
+      expect(gone).toEqual({ id: created.id, object: "webhook_endpoint", deleted: true });
+      await expect(client.webhookEndpoints.retrieve(created.id)).rejects.toThrow();
+      const after = await client.webhookEndpoints.list<{ data: Array<{ id: string }> }>({
+        limit: 100,
+      });
+      expect(after.data.map((e) => e.id)).not.toContain(created.id);
     });
+  });
+
+  // ── filters ───────────────────────────────────────────────────────
+
+  describe("filters", () => {
+    scenario(
+      "filters.subscription_renewal_state",
+      "a paused subscription is found by renewal_state, never by status",
+      async () => {
+        const t = await provisionTenant("renewal");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const { price } = await makePlan(c, { amountCents: 1500 });
+        const sub = await activeSubscription(c, t, price.id);
+
+        const paused = await c.subscriptions.pause<{ status: string; renewal_state: string }>(
+          sub.id,
+        );
+        // The whole point: pausing lands in renewal_state and leaves
+        // status alone, because the customer has paid for this period.
+        expect(paused.renewal_state).toBe("paused");
+        expect(paused.status).toBe("active");
+
+        const byRenewalState = await c.subscriptions.list<{ data: Array<{ id: string }> }>({
+          renewal_state: "paused",
+        });
+        expect(byRenewalState.data.map((s) => s.id)).toContain(sub.id);
+
+        // ...and it is still an `active` subscription to the status filter.
+        const byStatus = await c.subscriptions.list<{ data: Array<{ id: string }> }>({
+          status: "active",
+        });
+        expect(byStatus.data.map((s) => s.id)).toContain(sub.id);
+
+        // `status=paused` is not a value the API accepts. It used to be,
+        // and returned a confident, wrong, empty page; now it is refused
+        // so the mistake is visible.
+        const err = await c.subscriptions.list({ status: "paused" }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(InvalidRequestError);
+        expect((err as InvalidRequestError).param).toBe("status");
+      },
+    );
   });
 
   // ── pagination ────────────────────────────────────────────────────
@@ -418,6 +562,83 @@ d("BillKit node SDK against a live API", () => {
       const fetched = await client.disputes.retrieve<{ id: string }>(dispute!.id);
       expect(fetched.id).toBe(dispute!.id);
     });
+  });
+
+  // ── usage ─────────────────────────────────────────────────────────
+
+  describe("usage", () => {
+    scenario(
+      "usage.record_and_replay",
+      "a usage record posts to a metered subscription and replays by key",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 5, usageType: "metered" });
+        const sub = await activeSubscription(client, tenant, price.id);
+
+        const key = idemKey();
+        const record = await client.subscriptions.createUsageRecord<{
+          id: string;
+          object: string;
+          subscription_id: string;
+          quantity: number;
+          invoice_id: string | null;
+        }>(sub.id, { quantity: 42, metadata: { source: "node-it" }, idempotencyKey: key });
+        expect(record.object).toBe("usage_record");
+        expect(record.subscription_id).toBe(sub.id);
+        expect(record.quantity).toBe(42);
+        expect(record.invoice_id).toBeNull();
+
+        // Replaying the same key must return the same record, not
+        // double-count the usage: that is what makes at-least-once
+        // reporting pipelines safe to retry.
+        const replay = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
+          quantity: 42,
+          metadata: { source: "node-it" },
+          idempotencyKey: key,
+        });
+        expect(replay.id).toBe(record.id);
+      },
+    );
+
+    scenario(
+      "usage.list_reconciliation",
+      "invoice_id=pending returns the posted, not-yet-invoiced records",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 3, usageType: "metered" });
+        const sub = await activeSubscription(client, tenant, price.id);
+
+        const posted: string[] = [];
+        for (const quantity of [10, 20, 30]) {
+          const r = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
+            quantity,
+          });
+          posted.push(r.id);
+        }
+
+        const pending = await client.subscriptions.listUsageRecords<{
+          id: string;
+          quantity: number;
+          invoice_id: string | null;
+        }>(sub.id, { invoice_id: "pending", limit: 100 });
+        expect(pending.object).toBe("list");
+        const ids = pending.data.map((r) => r.id);
+        for (const id of posted) expect(ids).toContain(id);
+        // Nothing pending may already claim an invoice.
+        for (const r of pending.data) expect(r.invoice_id).toBeNull();
+      },
+    );
+
+    scenario(
+      "usage.non_metered_rejected",
+      "posting usage to a licensed subscription is a typed 400",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 2500 });
+        const sub = await activeSubscription(client, tenant, price.id);
+
+        await expect(
+          client.subscriptions.createUsageRecord(sub.id, { quantity: 1 }),
+        ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
   });
 
   // ── webhooks ──────────────────────────────────────────────────────

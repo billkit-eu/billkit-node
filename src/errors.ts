@@ -5,8 +5,11 @@
  *
  *   { "error": { "type": "...", "code": "...", "message": "...", "param": "..." } }
  *
- * Each `type` maps to one error class so callers can `catch` on the
- * subclass they care about rather than branching on HTTP status codes.
+ * The HTTP **status** picks the class so callers can `catch` on the
+ * subclass they care about rather than branching on status codes; the
+ * envelope's `type`/`code`/`param` ride along on the thrown object.
+ * See {@link classForStatus} for why the status, not `type`, is the
+ * authority.
  */
 
 export interface ErrorEnvelope {
@@ -96,21 +99,6 @@ export class RateLimitError extends BillKitError {
   }
 }
 
-const TYPE_TO_CLASS: Record<string, new (msg: string, opts: BillKitErrorOptions) => BillKitError> =
-  {
-    api_connection_error: APIConnectionError,
-    // ``api_error`` is the Stripe-convention type for 5xx, so surface it as
-    // ServerError (a subclass of APIError) so `catch (e instanceof
-    // ServerError)` works without false negatives.
-    api_error: ServerError,
-    authentication_error: AuthenticationError,
-    permission_error: PermissionError,
-    invalid_request_error: InvalidRequestError,
-    idempotency_error: ConflictError,
-    conflict: ConflictError,
-    rate_limit_error: RateLimitError,
-  };
-
 function fallbackType(status: number): string {
   if (status === 401) return "authentication_error";
   if (status === 403) return "permission_error";
@@ -121,15 +109,35 @@ function fallbackType(status: number): string {
   return "invalid_request_error";
 }
 
-function fallbackClass(
+/**
+ * Pick the exception class from the HTTP **status**, not the envelope
+ * `type`.
+ *
+ * The status is the field the API cannot get wrong. The `type` is
+ * accurate for errors BillKit raises itself, but a request that never
+ * reaches a route handler — an unmatched path, a method the route does
+ * not allow — is serialised by the framework-level handler as
+ * `{"type": "api_error", "code": "unhandled"}` *with a 4xx status*.
+ * Trusting `type` there mapped a plain `404 Not Found` (a typo in a
+ * resource id, or an SDK/API version skew) onto `ServerError`, telling
+ * the caller BillKit had broken when their own request was at fault —
+ * and `ServerError` is the class retry/alerting policies key on.
+ *
+ * The envelope `type` is still preserved verbatim on
+ * {@link BillKitError.type} for callers that want it; only the class is
+ * status-driven.
+ */
+function classForStatus(
   status: number,
 ): new (msg: string, opts: BillKitErrorOptions) => BillKitError {
+  if (status >= 500) return ServerError;
   if (status === 401) return AuthenticationError;
   if (status === 403) return PermissionError;
   if (status === 404) return ResourceMissingError;
   if (status === 409) return ConflictError;
   if (status === 429) return RateLimitError;
-  if (status >= 500) return ServerError;
+  // Everything else below 500 (400, 405, 422, 451 …) is a request the
+  // caller has to change.
   return InvalidRequestError;
 }
 
@@ -149,9 +157,7 @@ export function errorFromResponse(args: {
   const message =
     envelope.message ?? `BillKit API returned HTTP ${status} with no error body.`;
 
-  let cls = TYPE_TO_CLASS[type] ?? fallbackClass(status);
-  if (status === 404 && cls === InvalidRequestError) cls = ResourceMissingError;
-  if (status === 409 && cls === InvalidRequestError) cls = ConflictError;
+  const cls = classForStatus(status);
 
   const options: BillKitErrorOptions & { retryAfter?: number | undefined } = {
     type,

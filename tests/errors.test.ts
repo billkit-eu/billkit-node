@@ -123,6 +123,47 @@ describe("error mapping", () => {
     }
   });
 
+  it("404 from an unmatched route (type api_error) -> ResourceMissingError", async () => {
+    // The exact envelope Starlette's handler emits for a path no route
+    // matches: `type: api_error` on a 404. Mapping on `type` made that a
+    // ServerError, blaming BillKit for the caller's typo — and
+    // ServerError is the class alerting and retry policies key on.
+    const { fetchImpl } = makeMockFetch([
+      {
+        status: 404,
+        body: {
+          error: { type: "api_error", code: "unhandled", message: "Not Found" },
+        },
+      },
+    ]);
+    try {
+      await client(fetchImpl).customers.retrieve("cus_typo");
+      expect.fail("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ResourceMissingError);
+      expect(err).not.toBeInstanceOf(ServerError);
+      // The envelope's own type is still preserved for callers who want it.
+      expect((err as ResourceMissingError).type).toBe("api_error");
+      expect((err as ResourceMissingError).code).toBe("unhandled");
+    }
+  });
+
+  it("405 method-not-allowed (type api_error) -> InvalidRequestError", async () => {
+    const { fetchImpl } = makeMockFetch([
+      {
+        status: 405,
+        body: {
+          error: { type: "api_error", code: "unhandled", message: "Method Not Allowed" },
+        },
+      },
+    ]);
+    const err = await client(fetchImpl)
+      .customers.retrieve("cus_1")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InvalidRequestError);
+    expect(err).not.toBeInstanceOf(ServerError);
+  });
+
   it("5xx with no envelope -> ServerError, still a BillKitError", async () => {
     // Traefik / nginx HTML body; must not crash on JSON parse.
     const fetchImpl: typeof fetch = async () =>

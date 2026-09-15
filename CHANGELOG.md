@@ -10,6 +10,37 @@ so the numbers will diverge after this first release.
 
 ## [Unreleased]
 
+### Added
+- `client.prices.update(id, { active: false })` archives a price
+  (`POST /v1/prices/{id}`). The price keeps its id and stays readable through
+  `retrieve()` and `list()`, because subscriptions renew against it by id.
+  Subscriptions already on it keep renewing; what stops is new business.
+  Re-archiving is a no-op that returns the price unchanged, so a retry is safe.
+  `active` is the only field a price accepts and `active: true` is refused,
+  because prices are immutable.
+- `client.subscriptions.list()` and `.iter()` now take `customer_id`, `status`
+  and `renewal_state` through the new `SubscriptionsListParams`, and `iter()`
+  carries the filter onto every page request instead of narrowing client-side.
+  Both filters take a comma-separated list.
+
+### Removed
+- `delete()` on `products`, `prices`, `coupons`, `taxRates` and
+  `webhookEndpoints`. None of them deleted anything: every one of those rows
+  stays readable afterwards, which is why they have to. Retire them through the
+  update route instead — `active: false` for products, prices, tax rates and
+  coupons, `status: "disabled"` for webhook endpoints. The server no longer
+  answers `DELETE` on those paths at all.
+
+### Changed
+- `client.customers.delete(id)` resolves to `{ id, object: "customer", deleted:
+  true }` instead of the customer. The customer leaves the API, so returning a
+  body that reads like a live resource said the opposite of what happened.
+- `renewal_state: "paused"` is the way to find paused subscriptions.
+  `status: "paused"` is no longer accepted by the API and now raises
+  `InvalidRequestError`: pausing sets `renewal_state` and leaves `status` at
+  `active`, because the customer has paid for the period they are in. The README
+  documents the split between the two filters.
+
 ## [0.1.0]
 
 First public release.

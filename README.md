@@ -93,25 +93,83 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 | Accessor | Verbs |
 | --- | --- |
 | `client.customers` | `create`, `retrieve`, `update`, `delete`, `list`, `iter` |
-| `client.products` | `create`, `retrieve`, `update`, `delete`, `list`, `iter` |
-| `client.prices` | `create`, `retrieve`, `list`, `iter` |
+| `client.products` | `create`, `retrieve`, `update` (archive with `active: false`), `list`, `iter` |
+| `client.prices` | `create`, `retrieve`, `update` (archive with `active: false`, restore with `active: true`), `list`, `iter` |
 | `client.checkoutSessions` | `create`, `retrieve` |
 | `client.oneShotPayments` | `create`, `retrieve` |
-| `client.subscriptions` | `retrieve`, `list`, `iter`, `cancel`, `pause`, `resume`, `previewUpdate`, `update`, `reauthorizePaymentMethod` |
+| `client.subscriptions` | `retrieve`, `list`, `iter` (filter by `customer_id`, `status`, `renewal_state`), `cancel`, `pause`, `resume`, `previewUpdate`, `update`, `reauthorizePaymentMethod` |
 | `client.refunds` | `create`, `retrieve`, `list`, `iter` |
-| `client.webhookEndpoints` | `create`, `retrieve`, `update`, `delete`, `rotateSecret`, `list`, `iter`, `listDeliveries`, `iterDeliveries`, `getDelivery`, `redeliver` |
+| `client.webhookEndpoints` | `create`, `retrieve`, `update` (stop delivery with `status: "disabled"`), `delete`, `rotateSecret`, `list`, `iter`, `listDeliveries`, `iterDeliveries`, `getDelivery`, `redeliver` |
 | `client.events` | `retrieve`, `list`, `iter` (filter by `type`) |
 | `client.tenant` | `capabilities`, `portalBranding`, `setPortalBranding`, `rotateProviderCredential` |
-| `client.coupons` | `create`, `retrieve`, `update`, `delete`, `validate`, `list`, `iter` |
-| `client.taxRates` | `create`, `retrieve`, `update`, `delete`, `list`, `iter` |
-| `client.invoices` | `retrieve`, `list`, `iter` |
+| `client.coupons` | `create`, `retrieve`, `update` (withdraw with `active: false`), `validate`, `list`, `iter` |
+| `client.taxRates` | `create`, `retrieve`, `update` (retire with `active: false`), `list`, `iter` |
+| `client.invoices` | `retrieve`, `retrievePdf`, `list`, `iter` |
 | `client.auditLogs` | `retrieve`, `list`, `iter` (filter by `action`, `resource_type`, `actor_id`) |
 | `client.payments` | `retrieve`, `list`, `iter` |
 | `client.billingPortalSessions` | `create`, `revoke` |
 
+### Retiring something, and deleting something
+
+`delete()` exists on `customers` and `webhookEndpoints`, and it resolves to `{ id, object, deleted: true }` rather than the object: it has left the API, so there is nothing to hand back. A deleted endpoint takes its delivery rows with it, because those are readable only through the endpoint that owns them; the events stay in `client.events`, which is the record of what you were sent.
+
+The catalogue is retired through its update route instead, because it stays readable afterwards. A price, a product, a tax rate and a coupon each take `active: false`. Each of them has to survive: subscriptions renew against a price by id, an invoice records the VAT percentage a tax rate produced, and a redeemed coupon is part of what a customer was charged.
+
+`status: "disabled"` on a webhook endpoint is the other half of the pair, not a substitute for deleting. It stops delivery and keeps the endpoint, its secret and its history, and it can be turned back on.
+
+```ts
+// Stop selling a price. It stays readable; customers on it keep renewing.
+await client.prices.update(price.id, { active: false });
+// ...and put it back. The amount never moved.
+await client.prices.update(price.id, { active: true });
+
+// Stop sending to an endpoint, without losing its signing secret.
+await client.webhookEndpoints.update(endpoint.id, { status: "disabled" });
+// Remove one entirely, along with its delivery rows.
+await client.webhookEndpoints.delete(endpoint.id); // → { deleted: true, ... }
+
+// Remove a customer. Refused while they hold a subscription that can
+// still charge them.
+await client.customers.delete(customer.id); // → { deleted: true, ... }
+```
+
+### Finding paused subscriptions
+
+`status` and `renewal_state` answer different questions, and only one of them knows about pausing. `status` is where the subscription stands with its payments (`incomplete`, `trialing`, `active`, `past_due`, `canceled`). `renewal_state` is what happens when the current period ends (`auto_renew`, `paused`, `canceling`, `stopped`). Pausing sets `renewal_state` and leaves `status` at `active`, because the customer has paid for the period they are in:
+
+```ts
+const paused = await client.subscriptions.list({ renewal_state: "paused" });
+```
+
+`status: "paused"` is not an accepted value and comes back as `InvalidRequestError`. Both filters take a comma-separated list (`status: "active,past_due"`), and an unrecognised value is rejected rather than silently ignored.
+
+### Embedded checkout
+
+Pass `ui_mode: "embedded"` and the session comes back with a `client_secret` instead of a `url`. Hand that to [`@billkit-eu/js`](https://www.npmjs.com/package/@billkit-eu/js) or [`@billkit-eu/react`](https://www.npmjs.com/package/@billkit-eu/react) and the card fields render on your own page, inside a cross-origin iframe. `cancel_url` is still required.
+
+```ts
+const session = await client.checkoutSessions.create<{ client_secret: string }>({
+  customer_id: customer.id,
+  price_id: price.id,
+  ui_mode: "embedded",
+  success_url: "https://app.example.com/success",
+  cancel_url: "https://app.example.com/cancel",
+  metadata: { order_id: "ord_42" },
+});
+```
+
+### Invoice PDFs
+
+```ts
+const pdf = await client.invoices.retrievePdf("inv_123");
+await writeFile("invoice.pdf", Buffer.from(pdf));
+```
+
+Returns the raw bytes. S3-backed deployments answer with a redirect to a presigned URL, which is followed transparently under the SDK's own timeout and retry policy, so both storage adapters look the same from here. A deployment with PDF rendering disabled throws a `ServerError` with `code: "rendering_pending"`; `retrieve()` still gives you the structured invoice to render yourself.
+
 ## Auto-pagination
 
-Every list-returning resource ships an `iter()` async iterator that walks the Stripe-shape `has_more` + `starting_after` cursor protocol for you. No more manual cursor loops:
+Every list-returning resource ships an `iter()` async iterator that walks the Stripe-shape `has_more` + `starting_after` cursor protocol for you. Pagination is forward-only — BillKit has no `ending_before` — so page backwards by holding onto the cursors you have already walked.
 
 ```ts
 for await (const customer of client.customers.iter()) {
@@ -153,6 +211,8 @@ const client = new BillKit({
 
 The SDK auto-generates an `Idempotency-Key` for every mutating call, so 5xx and short `Retry-After` 429 retries are safe: the server replays the original response when an earlier attempt completed. Pass `idempotencyKey` to coalesce retries across process restarts.
 
+`409 idempotency_in_progress` is retried too. It means an earlier request carrying the same key is still in flight, which is the one 4xx where giving up is the dangerous answer: that request may already have charged the customer, and the obvious workaround — retry with a *fresh* key — is exactly what turns one charge into two. The retry reuses the original key, so it either loses the race again or replays the first call's result. Every other 409 (`idempotency_key_in_use`, a conflicting subscription state) fails immediately, because retrying can only repeat it.
+
 ## Errors
 
 ```ts
@@ -179,6 +239,20 @@ try {
 ```
 
 All errors inherit from `BillKitError`. Subclasses: `APIConnectionError`, `APIError`, `ServerError`, `AuthenticationError`, `PermissionError`, `ResourceMissingError`, `InvalidRequestError`, `ConflictError`, `RateLimitError`.
+
+The class is chosen by **HTTP status**, not by the envelope's `type`:
+
+| Status | Class |
+|---|---|
+| 401 | `AuthenticationError` |
+| 403 | `PermissionError` |
+| 404 | `ResourceMissingError` |
+| 409 | `ConflictError` |
+| 429 | `RateLimitError` |
+| other 4xx (400, 405, 422, …) | `InvalidRequestError` |
+| 5xx | `ServerError` |
+
+The status is the field the API cannot get wrong. Requests that never reach a route handler — an unmatched path, a method the route does not allow — are serialised by the framework as `{"type": "api_error", "code": "unhandled"}` *with a 4xx status*, so mapping on `type` would turn a plain 404 into a `ServerError` and tell you BillKit had broken when the request was at fault. The envelope's `type`, `code` and `param` are all still on the thrown object if you want them.
 
 ## Logging
 
