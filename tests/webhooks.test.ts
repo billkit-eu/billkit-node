@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { WebhookVerificationError, verifyWebhookSignature } from "../src/webhooks.js";
 
-const SECRET = "whsec_unit_test_secret";
+const SECRET = "bkwhsec_unit_test_secret";
 const BODY = '{"id":"evt_1","type":"customer.created","data":{"id":"cus_1"}}';
 
 async function sign(body: string, secret: string, tsSeconds: number): Promise<string> {
@@ -80,7 +80,7 @@ describe("webhook verification", () => {
       verifyWebhookSignature({
         payload: BODY,
         signatureHeader: header,
-        secret: "whsec_wrong",
+        secret: "bkwhsec_wrong",
       }),
     ).rejects.toThrow(/mismatch/);
   });
@@ -132,7 +132,7 @@ describe("webhook verification", () => {
   it("accepts when any of multiple v1 values matches (rotation)", async () => {
     const ts = Math.floor(Date.now() / 1000);
     const good = await sign(BODY, SECRET, ts); // "t=...,v1=<good>"
-    const bad = await sign(BODY, "whsec_rotated_out", ts);
+    const bad = await sign(BODY, "bkwhsec_rotated_out", ts);
     const badHex = bad.split("v1=")[1];
     const header = `${good},v1=${badHex}`; // t=...,v1=<good>,v1=<bad>
 
@@ -146,8 +146,8 @@ describe("webhook verification", () => {
 
   it("rejects when none of multiple v1 values match", async () => {
     const ts = Math.floor(Date.now() / 1000);
-    const bad1 = (await sign(BODY, "whsec_wrong_a", ts)).split("v1=")[1];
-    const bad2 = (await sign(BODY, "whsec_wrong_b", ts)).split("v1=")[1];
+    const bad1 = (await sign(BODY, "bkwhsec_wrong_a", ts)).split("v1=")[1];
+    const bad2 = (await sign(BODY, "bkwhsec_wrong_b", ts)).split("v1=")[1];
     await expect(
       verifyWebhookSignature({
         payload: BODY,

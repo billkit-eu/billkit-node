@@ -51,7 +51,7 @@ describe("logging", () => {
     };
     const { fetchImpl } = makeMockFetch([{ status: 200, body: { id: "cus_1" } }]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       fetch: fetchImpl,
     });
@@ -85,7 +85,7 @@ describe("logging", () => {
       { status: 200, body: { id: "cus_1" }, headers: { "x-request-id": "req_abc" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       fetch: fetchImpl,
       logger,
@@ -113,7 +113,7 @@ describe("logging", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -134,7 +134,7 @@ describe("logging", () => {
     err.name = "FetchError";
     const { fetchImpl } = makeMockFetch([{ status: 0, error: err }, { status: 200, body: {} }]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -155,7 +155,7 @@ describe("logging", () => {
       { status: 500, body: { error: { type: "api_error", message: "boom" } } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -175,7 +175,7 @@ describe("logging", () => {
       { status: 200, body: { object: "list", data: [], has_more: false } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       fetch: fetchImpl,
       logger,
@@ -186,7 +186,7 @@ describe("logging", () => {
 
     const text = blob(lines);
     expect(text.length, "expected log lines; the rest would pass vacuously").toBeGreaterThan(0);
-    expect(text, "the API key reached a log call").not.toContain("sk_test_unit");
+    expect(text, "the API key reached a log call").not.toContain("bk_test_unit");
     expect(text, "the Authorization header reached a log call").not.toContain("Bearer");
     expect(text, "a body (PII) reached a log call").not.toContain("ada@example.com");
     expect(text, "a body (PII) reached a log call").not.toContain("Ada Lovelace");

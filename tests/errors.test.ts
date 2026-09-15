@@ -16,7 +16,7 @@ import { FAST_RETRY, makeMockFetch } from "./helpers.js";
 
 function client(fetchImpl: typeof fetch, retryPolicy: RetryPolicy = FAST_RETRY) {
   return new BillKit({
-    apiKey: "sk_test_unit",
+    apiKey: "bk_test_unit",
     baseUrl: "https://test.billkit.eu",
     retryPolicy,
     fetch: fetchImpl,

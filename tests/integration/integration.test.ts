@@ -129,7 +129,7 @@ d("BillKit node SDK against a live API", () => {
 
     scenario("auth.bad_key", "an unknown key raises AuthenticationError", async () => {
       const bogus = new BillKit({
-        apiKey: "sk_test_0000000000000000000000",
+        apiKey: "bk_test_0000000000000000000000",
         baseUrl: BASE_URL,
       });
       await expect(bogus.products.list()).rejects.toBeInstanceOf(AuthenticationError);
@@ -304,12 +304,12 @@ d("BillKit node SDK against a live API", () => {
         description: "node integration suite",
       });
       // The signing secret is returned exactly once, on create.
-      expect(created.secret).toMatch(/^whsec_/);
+      expect(created.secret).toMatch(/^bkwhsec_/);
 
       await client.webhookEndpoints.update(created.id, { description: "renamed" });
 
       const rotated = await client.webhookEndpoints.rotateSecret<{ secret: string }>(created.id);
-      expect(rotated.secret).toMatch(/^whsec_/);
+      expect(rotated.secret).toMatch(/^bkwhsec_/);
       expect(rotated.secret).not.toBe(created.secret);
 
       // Disabling stops delivery and keeps everything else, so the
@@ -652,7 +652,7 @@ d("BillKit node SDK against a live API", () => {
       return `t=${ts},v1=${mac}`;
     }
 
-    const SECRET = "whsec_integration_secret";
+    const SECRET = "bkwhsec_integration_secret";
     const BODY = JSON.stringify({ id: "evt_1", type: "subscription.created" });
 
     scenario("webhooks.verify_roundtrip", "a correctly signed payload verifies", async () => {

@@ -9,7 +9,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "cus_1", object: "customer", email: "a@b.co" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -24,7 +24,7 @@ describe("happy path", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/customers");
-    expect(calls[0]?.headers["authorization"]).toBe("Bearer sk_test_unit");
+    expect(calls[0]?.headers["authorization"]).toBe("Bearer bk_test_unit");
     expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
     expect(calls[0]?.headers["content-type"]).toBe("application/json");
   });
@@ -34,7 +34,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "sub_1", status: "active" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -49,7 +49,7 @@ describe("happy path", () => {
       { status: 200, body: { object: "list", data: [], has_more: false } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -67,7 +67,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "prod_1", active: false } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -94,7 +94,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "price_1", product_id: "prod_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -122,7 +122,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "sub_1", status: "canceled" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -139,7 +139,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "re_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -161,7 +161,7 @@ describe("happy path", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,

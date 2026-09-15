@@ -41,7 +41,7 @@ function stallingBodyFetch(): typeof fetch {
 describe("transport timeout", () => {
   it("bounds a stalled body read by timeoutMs", async () => {
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       timeoutMs: 25,
       retryPolicy: NO_RETRY,
@@ -53,7 +53,7 @@ describe("transport timeout", () => {
 
   it("reports a clear timeout message", async () => {
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       timeoutMs: 25,
       retryPolicy: NO_RETRY,

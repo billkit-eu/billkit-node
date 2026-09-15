@@ -17,7 +17,7 @@ describe("retry", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -35,7 +35,7 @@ describe("retry", () => {
       { status: 500, body: { error: { type: "api_error", message: "boom" } } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -55,7 +55,7 @@ describe("retry", () => {
       },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -77,7 +77,7 @@ describe("retry", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -97,7 +97,7 @@ describe("retry", () => {
       },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -125,7 +125,7 @@ describe("retry", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -154,7 +154,7 @@ describe("retry", () => {
       },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -175,7 +175,7 @@ describe("retry", () => {
     };
     const { fetchImpl, calls } = makeMockFetch([inProgress, inProgress, inProgress]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
@@ -193,7 +193,7 @@ describe("retry", () => {
       { status: 200, body: { id: "cus_1" } },
     ]);
     const client = new BillKit({
-      apiKey: "sk_test_unit",
+      apiKey: "bk_test_unit",
       baseUrl: "https://test.billkit.eu",
       retryPolicy: FAST_RETRY,
       fetch: fetchImpl,
