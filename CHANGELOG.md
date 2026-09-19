@@ -8,6 +8,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [0.3.0]
+
+### Added
+- **Metered pricing below one minor unit.** `prices.create` takes
+  `unit_amount_decimal`: a per-unit rate in **minor units** with up to 12
+  decimal places, so `"0.02"` (0.02 cents, i.e. EUR 0.0002 per unit) is finally
+  expressible. `amount_cents` is an integer and could never say it. Metered
+  prices only.
+
+  It is typed as a `string`, so a `number` is a compile error. A number is also
+  refused at runtime with a `TypeError`, for the callers the type system cannot
+  reach — plain JavaScript, a value that came through `any`, a parsed JSON body.
+  A double cannot hold 0.0002 exactly, so accepting one would work for the rates
+  that happen to round-trip and silently mis-price the ones that do not.
+- **Tiered pricing.** `prices.create({ billing_scheme: "tiered", tiers_mode,
+  tiers })`, with the new exported `PriceTier` type. `tiers_mode: "graduated"`
+  prices the units inside each band; `"volume"` lets the period total pick one
+  band which then prices every unit. The same table under the two modes is a
+  different bill, so the mode is required rather than defaulted. The last band
+  must be `up_to: "inf"`. Each band's `unit_amount_decimal` gets the same
+  string-only treatment.
+- **`identifier` on `subscriptions.createUsageRecord`**, for the retry an
+  `Idempotency-Key` cannot catch. The key covers a retry of one HTTP request;
+  `identifier` covers a retry of *your own* call — a job runner replaying a
+  task, a queue delivering twice — which arrives as a genuinely new request with
+  a new key. It is unique within the subscription, and a second report of the
+  same identifier returns the first record unchanged rather than billing twice.
+  If your reporting pipeline is at-least-once, this is the one that matters.
+- **`subscriptions.retrieveUsageSummary(id)`**, the money view of pending usage:
+  `pending_quantity`, `net_cents` / `tax_cents` / `gross_cents` computed through
+  the same rate or tier table the period close uses, and `will_charge`. Read
+  `will_charge` before promising a customer an amount: a period under
+  `minimum_charge_cents` (EUR 1.00) is **not** charged, because the provider
+  would refuse it, and the usage rolls into the next period instead. Previously
+  the only record of that decision was a server log line. `open_invoice_id`
+  names an earlier cycle still unsettled.
+- **`refund_on_cancel` on `prices.create`.** Server-side since the `0066`
+  migration and unreachable from this SDK until now. `"full"` or `"prorated"`
+  issues the refund a cancellation promised without anyone having to remember
+  to. Metered prices must leave it at `"none"`.
+
+### Changed
+- `CreatePriceParams.amount_cents` is now **optional**, because a price can be
+  priced by `unit_amount_decimal` or by `tiers` instead. Exactly one of the
+  three is required, and the server refuses a price with none of them. Existing
+  calls are unaffected.
+- `prices.create` is now `async`. It was already `Promise`-returning, but the
+  new rate guard throws, and a synchronous throw out of a method typed
+  `Promise<T>` escapes `.catch()` — so the throw is delivered as a rejection
+  instead, and one error path handles both.
+
 ## [0.2.1]
 
 ### Changed

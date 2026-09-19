@@ -84,6 +84,7 @@ export type {
   EventsListParams,
   IdempotencyOptions,
   ListParams,
+  PriceTier,
   PricesListParams,
   RotateProviderCredentialParams,
   SetPortalBrandingParams,

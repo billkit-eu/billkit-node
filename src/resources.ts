@@ -109,6 +109,15 @@ export interface UpdateCustomerParams extends IdempotencyOptions {
   metadata?: Record<string, string>;
 }
 
+/** Query parameters accepted by `GET /v1/customers`. */
+export interface CustomerListParams extends BaseListParams {
+  /**
+   * `false` for customers who have paid, `true` for abandoned checkouts,
+   * omitted for both.
+   */
+  provisional?: boolean;
+}
+
 /**
  * Body for `POST /v1/customers/{id}/vat_number`. The VAT number is
  * sent through VIES server-side; the response carries
@@ -138,6 +147,16 @@ export interface CreateProductParams extends IdempotencyOptions {
   marketing_features?: string[];
   /** Small string metadata map echoed back on the Product object. */
   metadata?: Record<string, string>;
+  /**
+   * Let a *buyer* type a coupon code at the embedded checkout for this
+   * product. Defaults to `false`. A coupon you apply yourself by passing
+   * `coupon_code` when you create a Checkout Session is unaffected — that
+   * is you discounting your own sale, and it has never needed this flag.
+   *
+   * The code is redeemed only once the payment settles, so a shopper who
+   * tries a single-use code and abandons the checkout does not use it up.
+   */
+  allow_promotion_codes?: boolean;
 }
 
 export interface UpdateProductParams extends IdempotencyOptions {
@@ -147,6 +166,8 @@ export interface UpdateProductParams extends IdempotencyOptions {
   metadata?: Record<string, string>;
   /** Set false to stop selling a product without deleting history. */
   active?: boolean;
+  /** See {@link CreateProductParams.allow_promotion_codes}. */
+  allow_promotion_codes?: boolean;
 }
 
 /**
@@ -159,16 +180,94 @@ export interface UpdatePriceParams extends IdempotencyOptions {
   active: boolean;
 }
 
+/**
+ * One band of a tiered price.
+ *
+ * `up_to` is inclusive, and the **last band must be `"inf"`** because a
+ * bounded top band cannot price the usage above it. Bands must strictly
+ * increase.
+ *
+ * A band names a unit rate (`unit_amount` in whole minor units, or
+ * `unit_amount_decimal` for a finer one), a `flat_amount` charged once for
+ * reaching the band, or both. Write a free band as `unit_amount: 0` rather
+ * than by omitting the rate, so "free" is something the price says instead
+ * of something it forgot.
+ */
+export interface PriceTier {
+  up_to: number | "inf";
+  /** Whole minor units per unit in this band. */
+  unit_amount?: number;
+  /**
+   * A rate finer than one minor unit, **as a string** — see
+   * {@link CreatePriceParams.unit_amount_decimal} for why it is never a
+   * `number`.
+   */
+  unit_amount_decimal?: string;
+  /** Charged once when the usage reaches this band. Whole minor units. */
+  flat_amount?: number;
+}
+
 export interface CreatePriceParams extends IdempotencyOptions {
   /** Existing Product id returned from `client.products.create`. */
   product_id: string;
-  amount_cents: number;
+  /**
+   * Whole minor units per period (licensed) or per unit (metered).
+   *
+   * Optional because a metered price can be priced by
+   * {@link CreatePriceParams.unit_amount_decimal} or by
+   * {@link CreatePriceParams.tiers} instead. Exactly one of the three; a
+   * price with none of them is refused server-side.
+   */
+  amount_cents?: number;
+  /**
+   * A per-unit rate smaller than one minor unit, in **minor units**, to 12
+   * decimal places. `"0.02"` is 0.02 cents, i.e. EUR 0.0002 per unit, which
+   * is the canonical per-API-call price and not expressible as an integer.
+   * Metered prices only.
+   *
+   * **It is a `string`, and that is load-bearing.** A JS `number` is an
+   * IEEE-754 double and cannot hold 0.0002 exactly, so the rate would be
+   * corrupted before it was ever multiplied by a quantity. The type forbids
+   * a number at compile time, and the SDK throws a `TypeError` if an
+   * untyped JavaScript caller passes one anyway.
+   *
+   * The period's whole quantity is multiplied by the rate and rounded
+   * **once**, at the invoice.
+   */
+  unit_amount_decimal?: string;
+  /**
+   * `"per_unit"` (the default) multiplies one rate by the quantity.
+   * `"tiered"` prices by bands and requires
+   * {@link CreatePriceParams.tiers} and
+   * {@link CreatePriceParams.tiers_mode}. Metered prices only.
+   */
+  billing_scheme?: "per_unit" | "tiered";
+  /**
+   * How a tier table is read, and there is **no default** because the same
+   * table means two different bills. `"graduated"` prices the units inside
+   * each band; `"volume"` lets the period total pick one band which then
+   * prices every unit. 1,500 units against "first 1,000 at EUR 0.01, then
+   * EUR 0.005" is EUR 12.50 graduated and EUR 7.50 by volume.
+   */
+  tiers_mode?: "graduated" | "volume";
+  /** The band table. Required when `billing_scheme` is `"tiered"`, refused otherwise. */
+  tiers?: PriceTier[];
   currency: string;
   interval: "month" | "year" | (string & {});
   metadata?: Record<string, string>;
   trial_days?: number;
   trial_verification_cents?: number;
-  payment_methods?: Array<"creditcard" | "directdebit" | (string & {})>;
+  payment_methods?: Array<"creditcard" | "directdebit" | "ideal" | "applepay" | (string & {})>;
+  /**
+   * What a cancellation refunds without being asked. `"none"` (the default)
+   * nothing; `"full"` the whole last charge; `"prorated"` the unused part
+   * of the current period. Both non-none modes also end access
+   * immediately, and both stay bounded by the refund window below.
+   *
+   * Metered prices must leave this at `"none"`: ending access mid-period
+   * would strand usage that has not been billed yet.
+   */
+  refund_on_cancel?: "none" | "full" | "prorated";
   /**
    * Per-Price refund-window override (`POST /v1/prices`). `undefined`
    * inherits the default policy table (7d / 30d initial, 3d renewal);
@@ -189,12 +288,15 @@ export interface CreatePriceParams extends IdempotencyOptions {
   tax_behavior?: "inclusive" | "exclusive" | "unspecified";
   /**
    * `"licensed"` (the default when omitted) bills `amount_cents` per
-   * period regardless of consumption. `"metered"` bills
-   * `amount_cents` **per reported unit**: post consumption with
-   * `subscriptions.createUsageRecord` and the renewal invoice charges
-   * `amount_cents × sum(quantity)` for the period. Metered prices
-   * must be `interval: "month"`, carry `amount_cents > 0`, and cannot
-   * have `trial_days`.
+   * period regardless of consumption. `"metered"` bills **per reported
+   * unit**: post consumption with `subscriptions.createUsageRecord`, and
+   * at each period close BillKit invoices the period's total and charges
+   * the stored mandate.
+   *
+   * A metered unit is priced by `amount_cents`, by `unit_amount_decimal`,
+   * or by `tiers` — exactly one. Metered prices must be
+   * `interval: "month"`, cannot have `trial_days`, and cannot set
+   * `refund_on_cancel`.
    */
   usage_type?: "licensed" | "metered";
 }
@@ -213,6 +315,22 @@ export interface CreateUsageRecordParams extends IdempotencyOptions {
    * the record must land in the period the usage occurred.
    */
   occurred_at?: number;
+  /**
+   * Your own id for the event being metered, unique within this
+   * subscription. This is the dedupe an `Idempotency-Key` cannot do.
+   *
+   * The key covers a retry of *one HTTP request*, including the SDK's own
+   * internal retries. `identifier` covers a retry of *your* call — a job
+   * runner replaying a task, a queue delivering twice, your code
+   * re-invoking after its own timeout — which arrives at the API as a
+   * genuinely new request with a new key. A second report of the same
+   * identifier returns the first record unchanged instead of billing
+   * twice.
+   *
+   * If your reporting pipeline is at-least-once, this is the one that
+   * matters.
+   */
+  identifier?: string;
   /** Small string metadata map echoed back on the record. */
   metadata?: Record<string, string>;
 }
@@ -254,7 +372,7 @@ export interface CreateCheckoutSessionParams extends IdempotencyOptions {
    * the customer's available methods; when set, must be in the price's
    * `payment_methods` allowlist.
    */
-  method?: "creditcard" | "directdebit" | (string & {});
+  method?: "creditcard" | "directdebit" | "ideal" | "applepay" | (string & {});
   /** Optional coupon code applied at checkout; atomically claimed. */
   coupon_code?: string;
   /**
@@ -321,7 +439,14 @@ export interface CreateOneShotPaymentParams extends IdempotencyOptions {
    * *request* type the server validates, so an SDK that lags a newly-added
    * method should not be the thing that blocks the call.
    */
-  method: "creditcard" | "directdebit" | "ideal" | "bancontact" | "eps" | (string & {});
+  method:
+    | "creditcard"
+    | "directdebit"
+    | "ideal"
+    | "bancontact"
+    | "eps"
+    | "applepay"
+    | (string & {});
   /** Where Mollie returns the payer after the hosted checkout. */
   success_url: string;
   /** Optional page for an abandoned/cancelled payment. */
@@ -469,6 +594,40 @@ function splitIdempotency<P extends IdempotencyOptions>(
 }
 
 /**
+ * Refuse a sub-minor-unit rate that arrived as a `number`.
+ *
+ * The type already forbids it, so this exists for the callers the type
+ * system cannot reach: plain JavaScript, a value that came through `any`,
+ * a body parsed from JSON. A double cannot hold 0.0002 exactly, so
+ * accepting one would work for the rates that happen to round-trip and
+ * silently mis-price the ones that do not — the worst of the three
+ * available behaviours, and the reason the field is a string in the first
+ * place.
+ */
+function assertDecimalRateIsString(value: unknown, field: string): void {
+  if (value === undefined || value === null || typeof value === "string") return;
+  throw new TypeError(
+    `${field} must be a string, not a ${typeof value}. A JavaScript number cannot ` +
+      "hold a rate like 0.0002 exactly, so it would be corrupted before it was ever " +
+      `multiplied by a quantity. Pass it as a string: "${String(value)}".`,
+  );
+}
+
+/** Same check at the price level and inside every band of a tier table. */
+function assertPriceRatesAreStrings(params: CreatePriceParams): CreatePriceParams {
+  assertDecimalRateIsString(params.unit_amount_decimal, "unit_amount_decimal");
+  // Inside a tier is where a rate is most likely to be typed as a bare
+  // literal, so the guard has to reach in there too.
+  (params.tiers ?? []).forEach((tier, index) => {
+    assertDecimalRateIsString(
+      (tier as PriceTier | undefined)?.unit_amount_decimal,
+      `tiers[${index}].unit_amount_decimal`,
+    );
+  });
+  return params;
+}
+
+/**
  * Shared transport wrapper. Resources subclass this so each method
  * reads as a single line, "verb to path with params", instead of
  * the four-line `this.t.request({ ... })` boilerplate the previous
@@ -550,7 +709,17 @@ export class Customers extends BaseResource {
     return this.del<T>(`/v1/customers/${id}`, params);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  /**
+   * List customers, newest first.
+   *
+   * `provisional` filters on whether the customer ever completed a
+   * payment. A checkout that captures an email commits its Customer
+   * before the charge, so a checkout nobody finished leaves a row behind:
+   * pass `false` for real customers only, `true` for the abandoned ones
+   * (the cart-recovery worklist), or omit for both. Abandoned rows are
+   * swept after the tenant's retention window.
+   */
+  list<T = unknown>(params: CustomerListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/customers", params);
   }
 
@@ -615,9 +784,23 @@ export class Products extends BaseResource {
 }
 
 export class Prices extends BaseResource {
-  /** Create immutable billing terms for an existing Product. */
-  create<T = unknown>(params: CreatePriceParams): Promise<T> {
-    return this.post<T, CreatePriceParams>("/v1/prices", params);
+  /**
+   * Create immutable billing terms for an existing Product.
+   *
+   * A licensed price sends `amount_cents`. A metered price sends one of
+   * `amount_cents`, `unit_amount_decimal` (a rate finer than one minor
+   * unit, as a string) or `billing_scheme: "tiered"` with `tiers` and
+   * `tiers_mode`. Throws `TypeError` before any HTTP call if a decimal
+   * rate arrives as a number — see
+   * {@link CreatePriceParams.unit_amount_decimal}.
+   */
+  // `async` on purpose. The rate guard throws, and a synchronous throw out
+  // of a method typed `Promise<T>` escapes `.catch()` entirely — the caller
+  // would have to wrap the call site in try/catch as well, which nobody
+  // does for a promise-returning API. Marking it async turns the throw into
+  // a rejection, so one error path handles both.
+  async create<T = unknown>(params: CreatePriceParams): Promise<T> {
+    return this.post<T, CreatePriceParams>("/v1/prices", assertPriceRatesAreStrings(params));
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
@@ -783,13 +966,16 @@ export class Subscriptions extends BaseResource {
    *
    * Only valid when the subscription's price is `usage_type:
    * "metered"`; a licensed subscription is rejected with `400
-   * parameter_invalid`. Records accumulate until the renewal invoice
-   * rolls them up (`amount_cents × sum(quantity)`); the record's
-   * `invoice_id` stays `null` until then.
+   * parameter_invalid`. Records accumulate until the next period close
+   * rolls them into one invoice line; the record's `invoice_id` stays
+   * `null` until then. Records are immutable once written — they are the
+   * audit trail behind that line — so there is no update or delete.
    *
-   * Supports `Idempotency-Key` replay: retrying with the same key
-   * returns the same record instead of double-counting the usage,
-   * which is what makes at-least-once reporting pipelines safe.
+   * Two dedupe mechanisms, covering different failures. The
+   * `Idempotency-Key` the SDK sends covers a retry of this HTTP request,
+   * including its own internal retries. `params.identifier` covers a
+   * retry of *your* call, which arrives as a new request with a new key.
+   * See {@link CreateUsageRecordParams.identifier}.
    */
   createUsageRecord<T = unknown>(id: string, params: CreateUsageRecordParams): Promise<T> {
     return this.post<T, CreateUsageRecordParams>(`/v1/subscriptions/${id}/usage_records`, params);
@@ -818,6 +1004,28 @@ export class Subscriptions extends BaseResource {
       pageSize: options.pageSize,
       filters: { invoice_id: options.invoice_id },
     });
+  }
+
+  /**
+   * Price the pending usage, before the period close bills it.
+   *
+   * `listUsageRecords({ invoice_id: "pending" })` gives the quantity; this
+   * gives the money. `net_cents` / `tax_cents` / `gross_cents` are
+   * computed through the same rate or tier table and the same VAT
+   * resolution the close itself uses, so it is a forecast of the real
+   * invoice rather than an estimate.
+   *
+   * **Read `will_charge` before promising a customer an amount.** A period
+   * whose total is under `minimum_charge_cents` (EUR 1.00) is not charged,
+   * because the payment provider would refuse it. The usage is not lost:
+   * it stays pending and rolls into the next period, which is then billed
+   * for both.
+   *
+   * `open_invoice_id` names an earlier cycle that is invoiced and still
+   * unsettled; while one is open, this period cannot be charged.
+   */
+  retrieveUsageSummary<T = unknown>(id: string): Promise<T> {
+    return this.get<T>(`/v1/subscriptions/${id}/usage_summary`);
   }
 }
 

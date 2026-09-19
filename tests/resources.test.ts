@@ -688,3 +688,147 @@ describe("Subscriptions: list filters", () => {
     expect(new URL(calls[1]?.url ?? "").searchParams.get("starting_after")).toBe("sub_1");
   });
 });
+
+describe("Metered pricing: sub-cent rates, tiers, dedupe, summary", () => {
+  it("sends unit_amount_decimal as a JSON string, not a number", async () => {
+    // Asserted on the serialised body because the risk is exactly that it
+    // travels as a JSON number. A reader parsing `0.02` into a double gets
+    // a value that is not 0.02, and the rate is wrong before it has been
+    // multiplied by anything.
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", object: "price", unit_amount_decimal: "0.02" } },
+    ]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_api",
+      currency: "EUR",
+      interval: "month",
+      usage_type: "metered",
+      unit_amount_decimal: "0.02",
+    });
+    expect(calls[0]?.body).toContain('"unit_amount_decimal":"0.02"');
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body.unit_amount_decimal).toBe("0.02");
+    // A price priced by the decimal sends no integer amount at all.
+    expect("amount_cents" in body).toBe(false);
+  });
+
+  it("throws before any request when a decimal rate arrives as a number", async () => {
+    // The type forbids it; this is for the callers the type system cannot
+    // reach (plain JS, a value that came through `any`, a parsed body).
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await expect(
+      client(fetchImpl).prices.create({
+        product_id: "prod_api",
+        currency: "EUR",
+        interval: "month",
+        usage_type: "metered",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        unit_amount_decimal: 0.0002 as any,
+      }),
+    ).rejects.toThrow(TypeError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("sends a tier table, including up_to: 'inf' on the last band", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", object: "price" } },
+    ]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_api",
+      currency: "EUR",
+      interval: "month",
+      usage_type: "metered",
+      billing_scheme: "tiered",
+      tiers_mode: "graduated",
+      tiers: [
+        { up_to: 1000, unit_amount: 1 },
+        { up_to: "inf", unit_amount_decimal: "0.5", flat_amount: 500 },
+      ],
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body.billing_scheme).toBe("tiered");
+    expect(body.tiers_mode).toBe("graduated");
+    expect(body.tiers).toEqual([
+      { up_to: 1000, unit_amount: 1 },
+      { up_to: "inf", unit_amount_decimal: "0.5", flat_amount: 500 },
+    ]);
+  });
+
+  it("throws when a number rate is hidden inside a tier", async () => {
+    // Inside a band is where a rate is most likely to be typed as a bare
+    // literal, so the guard has to reach in there too.
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await expect(
+      client(fetchImpl).prices.create({
+        product_id: "prod_api",
+        currency: "EUR",
+        interval: "month",
+        usage_type: "metered",
+        billing_scheme: "tiered",
+        tiers_mode: "graduated",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        tiers: [{ up_to: "inf", unit_amount_decimal: 0.5 as any }],
+      }),
+    ).rejects.toThrow(/tiers\[0\]\.unit_amount_decimal/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("carries refund_on_cancel on create", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "price_1", refund_on_cancel: "prorated" } },
+    ]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_1",
+      amount_cents: 1499,
+      currency: "EUR",
+      interval: "month",
+      refund_on_cancel: "prorated",
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}").refund_on_cancel).toBe("prorated");
+  });
+
+  it("carries the usage identifier, the dedupe an Idempotency-Key cannot do", async () => {
+    // A job runner replaying its own task sends a NEW request with a NEW
+    // key, so only a natural key stops the second report being a second
+    // charge.
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 201, body: { id: "ur_1", object: "usage_record", identifier: "job-42" } },
+    ]);
+    await client(fetchImpl).subscriptions.createUsageRecord("sub_1", {
+      quantity: 10,
+      identifier: "job-42",
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ quantity: 10, identifier: "job-42" });
+  });
+
+  it("omits identifier when it is not given", async () => {
+    // Dedupe is opt-in: two identical reports at different times are
+    // legitimately two records.
+    const { fetchImpl, calls } = makeMockFetch([{ status: 201, body: { id: "ur_1" } }]);
+    await client(fetchImpl).subscriptions.createUsageRecord("sub_1", { quantity: 10 });
+    expect("identifier" in JSON.parse(calls[0]?.body ?? "{}")).toBe(false);
+  });
+
+  it("retrieveUsageSummary GETs the summary route", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 200,
+        body: {
+          object: "usage_summary",
+          pending_quantity: 3,
+          gross_cents: 15,
+          will_charge: false,
+          minimum_charge_cents: 100,
+        },
+      },
+    ]);
+    const summary = await client(fetchImpl).subscriptions.retrieveUsageSummary<{
+      will_charge: boolean;
+    }>("sub_1");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/subscriptions/sub_1/usage_summary");
+    expect(calls[0]?.method).toBe("GET");
+    // The point of the endpoint: EUR 0.15 of usage will not be charged
+    // this cycle, and the caller can see that before promising an amount.
+    expect(summary.will_charge).toBe(false);
+  });
+});
