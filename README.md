@@ -97,7 +97,7 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 | `client.prices` | `create`, `retrieve`, `update` (archive with `active: false`, restore with `active: true`), `list`, `iter` |
 | `client.checkoutSessions` | `create`, `retrieve` |
 | `client.oneShotPayments` | `create`, `retrieve` |
-| `client.subscriptions` | `retrieve`, `list`, `iter` (filter by `customer_id`, `status`, `renewal_state`), `cancel`, `pause`, `resume`, `previewUpdate`, `update`, `reauthorizePaymentMethod` |
+| `client.subscriptions` | `retrieve`, `list`, `iter` (filter by `customer_id`, `status`, `renewal_state`), `cancel`, `pause`, `resume`, `reactivate`, `previewUpdate`, `update`, `reauthorizePaymentMethod`, `createUsageRecord`, `listUsageRecords`, `iterUsageRecords`, `retrieveUsageSummary` |
 | `client.refunds` | `create`, `retrieve`, `list`, `iter` |
 | `client.webhookEndpoints` | `create`, `retrieve`, `update` (stop delivery with `status: "disabled"`), `delete`, `rotateSecret`, `list`, `iter`, `listDeliveries`, `iterDeliveries`, `getDelivery`, `redeliver` |
 | `client.events` | `retrieve`, `list`, `iter` (filter by `type`) |
@@ -142,6 +142,73 @@ const paused = await client.subscriptions.list({ renewal_state: "paused" });
 ```
 
 `status: "paused"` is not an accepted value and comes back as `InvalidRequestError`. Both filters take a comma-separated list (`status: "active,past_due"`), and an unrecognised value is rejected rather than silently ignored.
+
+### Metered billing
+
+A metered price charges for what was consumed. You report usage; at each period close BillKit invoices the period's total and charges the stored mandate.
+
+There are three ways to price a unit, and a price uses exactly one of them.
+
+```ts
+// 1. Whole minor units: 5 cents per unit.
+await client.prices.create({
+  product_id: product.id, amount_cents: 5,
+  currency: "EUR", interval: "month", usage_type: "metered",
+});
+
+// 2. Finer than a minor unit. "0.02" is 0.02 CENTS, i.e. EUR 0.0002 per unit:
+//    the canonical per-API-call price, which no integer can express.
+await client.prices.create({
+  product_id: product.id, unit_amount_decimal: "0.02",
+  currency: "EUR", interval: "month", usage_type: "metered",
+});
+
+// 3. By bands. "graduated" prices the units inside each band; "volume" lets
+//    the period total pick one band which then prices every unit. The same
+//    table under the two modes is a different bill, so the mode is required.
+await client.prices.create({
+  product_id: product.id, currency: "EUR", interval: "month",
+  usage_type: "metered", billing_scheme: "tiered", tiers_mode: "graduated",
+  tiers: [
+    { up_to: 1000, unit_amount: 1 },                // first 1,000 at EUR 0.01
+    { up_to: "inf", unit_amount_decimal: "0.5" },   // then EUR 0.005
+  ],
+});
+```
+
+`amount_cents` is optional for that reason. Send none of the three and the server refuses the price.
+
+**`unit_amount_decimal` is a `string`, and a `number` will not compile.** A JS number is an IEEE-754 double and cannot hold 0.0002 exactly, so accepting one would work for the rates that happen to round-trip and silently mis-price the ones that do not. A number that reaches it anyway (plain JavaScript, a value through `any`, a parsed body) is rejected with a `TypeError` before the request goes out. The same applies to a band's `unit_amount_decimal`.
+
+The rate is in **minor units**, so `"0.02"` is two hundredths of a cent, not two cents. The period's whole quantity is multiplied by the rate and rounded once, at the invoice, so a sub-cent rate loses nothing per record.
+
+The last band must be `up_to: "inf"`, because a bounded top band cannot price the usage above it. Write a free band as `unit_amount: 0`. Metered prices must use `interval: "month"`, cannot have `trial_days`, and cannot set `refund_on_cancel`.
+
+#### Reporting usage exactly once
+
+```ts
+await client.subscriptions.createUsageRecord(sub.id, {
+  quantity: 1200,
+  identifier: "job-2026-09-19T10:00Z", // your id for what you are metering
+});
+```
+
+Two dedupe mechanisms, and they cover different failures. The `Idempotency-Key` the SDK sends covers a retry of *that HTTP request*, including its own internal retries. `identifier` covers a retry of *your* call — a job runner replaying a task, a queue delivering twice, your code re-invoking after its own timeout — which reaches the API as a genuinely new request with a new key. A second report of the same identifier returns the first record unchanged rather than billing twice. If your reporting pipeline is at-least-once, `identifier` is the one that matters.
+
+Records are immutable once written: they are the audit trail behind an invoice line, so there is no update or delete.
+
+#### Knowing what the next invoice will be
+
+```ts
+const summary = await client.subscriptions.retrieveUsageSummary<{
+  pending_quantity: number;
+  gross_cents: number;
+  will_charge: boolean;
+  minimum_charge_cents: number;
+}>(sub.id);
+```
+
+Check `will_charge` before you promise a customer an amount. A period whose total is under `minimum_charge_cents` (EUR 1.00) is **not** charged, because the payment provider would refuse it. The usage is not lost: it stays pending and rolls into the next period, which is then billed for both. `net_cents` / `tax_cents` / `gross_cents` are computed through the same rate or tier table and the same VAT resolution the close itself uses, so this is a forecast of the real invoice rather than an estimate. `open_invoice_id` names an earlier cycle that is invoiced and still unsettled; while one is open, this period cannot be charged.
 
 ### Embedded checkout
 
