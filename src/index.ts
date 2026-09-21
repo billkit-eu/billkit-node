@@ -81,6 +81,7 @@ export type {
   CreateTaxRateParams,
   CreateUsageRecordParams,
   CreateWebhookEndpointParams,
+  CreditNotesListParams,
   EventsListParams,
   IdempotencyOptions,
   ListParams,
@@ -96,6 +97,7 @@ export type {
   UpdateWebhookEndpointParams,
   UsageRecordsListParams,
   ValidateCouponParams,
+  VoidInvoiceParams,
 } from "./resources.js";
 export { DEFAULT_RETRY_POLICY, type RetryPolicy } from "./retry.js";
 export { VERSION } from "./version.js";

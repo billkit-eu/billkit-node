@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [0.4.0]
+
+### Added
+- **`creditNotes`** — `retrieve`, `list`, `iter` and `retrievePdf`. A credit
+  note is the document that reverses an issued invoice; one is created for you
+  when a refund settles, so there is no `create` here. `list` takes
+  `invoice_id` to answer "was this sale credited, and by how much".
+- **`invoices.void(id)`** — records that an invoice was never owed. It keeps
+  its number and stays readable; it just stops being a receivable.
+
+  A **paid** invoice is refused with a `ConflictError` whose `code` is
+  `"invoice_not_voidable"`. Once the money has moved, "never owed" is not
+  true — refund the payment instead, and a credit note is issued when the
+  refund settles. Voiding twice is a no-op.
+
 ## [0.3.0]
 
 ### Added

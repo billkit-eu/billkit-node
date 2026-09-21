@@ -336,6 +336,87 @@ d("BillKit node SDK against a live API", () => {
       });
       expect(after.data.map((e) => e.id)).not.toContain(created.id);
     });
+
+    scenario(
+      "crud.price_decimal_rate",
+      "a 12-dp unit_amount_decimal round-trips byte-identical as a string",
+      async () => {
+        const product = await client.products.create<{ id: string }>({
+          name: `Metered ${idemKey()}`,
+        });
+        // Twelve decimal places, in MINOR units. The value is chosen so that
+        // any float anywhere on the path visibly destroys it.
+        const RATE = "0.000000000001";
+        const price = await client.prices.create<{
+          id: string;
+          unit_amount_decimal: string;
+          usage_type: string;
+        }>({
+          product_id: product.id,
+          currency: "EUR",
+          interval: "month",
+          usage_type: "metered",
+          unit_amount_decimal: RATE,
+        });
+        expect(typeof price.unit_amount_decimal).toBe("string");
+        expect(price.unit_amount_decimal).toBe(RATE);
+
+        // And on the read path, which is a separate serializer.
+        const fetched = await client.prices.retrieve<{ unit_amount_decimal: string }>(price.id);
+        expect(typeof fetched.unit_amount_decimal).toBe("string");
+        expect(fetched.unit_amount_decimal).toBe(RATE);
+      },
+    );
+
+    scenario("crud.price_tiered", "a tiered metered price round-trips every band", async () => {
+      const product = await client.products.create<{ id: string }>({
+        name: `Tiered ${idemKey()}`,
+      });
+      const price = await client.prices.create<{
+        id: string;
+        billing_scheme: string;
+        tiers_mode: string;
+        tiers: Array<{ up_to: number | string; unit_amount_decimal?: string }>;
+      }>({
+        product_id: product.id,
+        currency: "EUR",
+        interval: "month",
+        usage_type: "metered",
+        billing_scheme: "tiered",
+        // Never defaulted: the same table under the two modes is a different
+        // bill, not a rounding difference.
+        tiers_mode: "graduated",
+        tiers: [
+          { up_to: 1000, unit_amount_decimal: "0.05" },
+          { up_to: "inf", unit_amount_decimal: "0.0125" },
+        ],
+      });
+      expect(price.billing_scheme).toBe("tiered");
+      expect(price.tiers_mode).toBe("graduated");
+      expect(price.tiers).toHaveLength(2);
+      for (const tier of price.tiers) {
+        expect(typeof tier.unit_amount_decimal).toBe("string");
+      }
+      expect(price.tiers[0]!.unit_amount_decimal).toBe("0.05");
+      expect(price.tiers[1]!.unit_amount_decimal).toBe("0.0125");
+    });
+
+    scenario(
+      "crud.credit_note_absent_until_refunded",
+      "credit notes are issued, never created",
+      async () => {
+        // There is no `create` on the resource at all — issuance hangs off a
+        // settled refund. Assert the read surface is reachable and honest
+        // about having nothing yet.
+        const page = await client.creditNotes.list<{ object: string; data: unknown[] }>({
+          limit: 10,
+        });
+        expect(page.object).toBe("list");
+        await expect(client.creditNotes.retrieve("cn_does_not_exist")).rejects.toBeInstanceOf(
+          ResourceMissingError,
+        );
+      },
+    );
   });
 
   // ── filters ───────────────────────────────────────────────────────
@@ -562,6 +643,100 @@ d("BillKit node SDK against a live API", () => {
       const fetched = await client.disputes.retrieve<{ id: string }>(dispute!.id);
       expect(fetched.id).toBe(dispute!.id);
     });
+
+    scenario(
+      "money.credit_note_for_refund",
+      "a settled refund issues a retrievable credit note",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 6400 });
+        const { providerPaymentId } = await checkoutToActive(client, tenant, price.id);
+
+        const subs = await client.subscriptions.list<{
+          data: Array<{ id: string; price_id: string }>;
+        }>({ limit: 100 });
+        const sub = subs.data.find((s) => s.price_id === price.id)!;
+        const payments = await client.payments.list<{
+          data: Array<{ id: string; subscription_id: string | null }>;
+        }>({ limit: 100 });
+        const payment = payments.data.find((p) => p.subscription_id === sub.id)!;
+
+        const invoices = await client.invoices.list<{
+          data: Array<{ id: string; payment_id: string | null; number: string }>;
+        }>({ limit: 100 });
+        const invoice = invoices.data.find((i) => i.payment_id === payment.id)!;
+        expect(invoice, "the settled charge should have produced an invoice").toBeTruthy();
+
+        const refund = await client.refunds.create<{ id: string; status: string }>({
+          payment_id: payment.id,
+          amount_cents: 6400,
+        });
+        expect(refund.status).toBe("pending");
+
+        // Nothing yet: the refund is pending and may still fail, and a
+        // gapless series cannot un-issue a number.
+        const before = await client.creditNotes.list<{ data: Array<{ id: string }> }>({
+          invoice_id: invoice.id,
+        });
+        expect(before.data).toHaveLength(0);
+
+        // Settle it at the provider, then re-deliver the payment webhook —
+        // the same order every money spec here uses.
+        await mollie.settleRefundsFor(providerPaymentId, "refunded");
+        await deliverMollieWebhook(tenant.mollieRouteId, providerPaymentId);
+
+        const notes = await client.creditNotes.list<{
+          data: Array<{
+            id: string;
+            number: string;
+            invoice_id: string;
+            subtotal_cents: number;
+            tax_cents: number;
+            total_cents: number;
+          }>;
+        }>({ invoice_id: invoice.id });
+        expect(notes.data).toHaveLength(1);
+        const note = notes.data[0]!;
+        expect(note.invoice_id).toBe(invoice.id);
+        // Its own series, deliberately distinct from the invoice's: a tax
+        // authority reads the two as different document classes.
+        expect(note.number.startsWith("CN-")).toBe(true);
+        expect(note.number).not.toBe(invoice.number);
+        // The identity the whole document rests on.
+        expect(note.subtotal_cents + note.tax_cents).toBe(note.total_cents);
+        expect(note.total_cents).toBe(6400);
+
+        const fetched = await client.creditNotes.retrieve<{ id: string; object: string }>(note.id);
+        expect(fetched.id).toBe(note.id);
+        expect(fetched.object).toBe("credit_note");
+      },
+    );
+
+    scenario(
+      "money.void_refused_on_paid_invoice",
+      "voiding a paid invoice is a typed conflict",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 1900 });
+        await checkoutToActive(client, tenant, price.id);
+
+        const subs = await client.subscriptions.list<{
+          data: Array<{ id: string; price_id: string }>;
+        }>({ limit: 100 });
+        const sub = subs.data.find((s) => s.price_id === price.id)!;
+        const invoices = await client.invoices.list<{
+          data: Array<{ id: string; subscription_id: string | null; status: string }>;
+        }>({ limit: 100 });
+        const invoice = invoices.data.find((i) => i.subscription_id === sub.id)!;
+        expect(invoice.status).toBe("paid");
+
+        // Not a limitation — the contract. Voiding claims the sale was never
+        // owed, which is false once the money moved; the reversal there is a
+        // credit note.
+        await expect(client.invoices.void(invoice.id)).rejects.toBeInstanceOf(ConflictError);
+        await client.invoices.void(invoice.id).catch((err: unknown) => {
+          expect((err as { code?: string }).code).toBe("invoice_not_voidable");
+        });
+      },
+    );
   });
 
   // ── usage ─────────────────────────────────────────────────────────
@@ -637,6 +812,69 @@ d("BillKit node SDK against a live API", () => {
         await expect(
           client.subscriptions.createUsageRecord(sub.id, { quantity: 1 }),
         ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
+
+    scenario(
+      "usage.dedupe_identifier",
+      "the same identifier under a different key returns the record on file",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 7, usageType: "metered" });
+        const sub = await activeSubscription(client, tenant, price.id);
+
+        const identifier = `job-${idemKey()}`;
+        const first = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
+          quantity: 9,
+          identifier,
+          idempotencyKey: idemKey(),
+        });
+        // A DIFFERENT idempotency key, so the transport-level replay guard
+        // cannot be what dedupes this. Only the natural key can.
+        const second = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
+          quantity: 9,
+          identifier,
+          idempotencyKey: idemKey(),
+        });
+        expect(second.id).toBe(first.id);
+
+        const pending = await client.subscriptions.listUsageRecords<{ id: string }>(sub.id, {
+          invoice_id: "pending",
+          limit: 100,
+        });
+        expect(pending.data.filter((r) => r.id === first.id)).toHaveLength(1);
+      },
+    );
+
+    scenario(
+      "usage.summary_forecast",
+      "usage_summary says what the next close will bill",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 11, usageType: "metered" });
+        const sub = await activeSubscription(client, tenant, price.id);
+        for (const quantity of [100, 250]) {
+          await client.subscriptions.createUsageRecord(sub.id, { quantity });
+        }
+
+        const summary = await client.subscriptions.retrieveUsageSummary<{
+          object: string;
+          subscription_id: string;
+          pending_quantity: number;
+          pending_record_count: number;
+          net_cents: number;
+          tax_cents: number;
+          gross_cents: number;
+          currency: string;
+          will_charge: boolean;
+          minimum_charge_cents: number;
+        }>(sub.id);
+        expect(summary.subscription_id).toBe(sub.id);
+        expect(summary.pending_quantity).toBe(350);
+        expect(summary.pending_record_count).toBe(2);
+        // 350 units at 11 cents. The forecast and the close share one
+        // predicate server-side, so this is the invoice, not an estimate.
+        expect(summary.net_cents).toBe(3850);
+        expect(summary.net_cents + summary.tax_cents).toBe(summary.gross_cents);
+        expect(summary.will_charge).toBe(true);
       },
     );
   });

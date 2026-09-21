@@ -12,6 +12,7 @@ import {
   BillingPortalSessions,
   CheckoutSessions,
   Coupons,
+  CreditNotes,
   Customers,
   Disputes,
   Events,
@@ -58,6 +59,7 @@ export class BillKit {
   readonly coupons: Coupons;
   readonly taxRates: TaxRates;
   readonly invoices: Invoices;
+  readonly creditNotes: CreditNotes;
   readonly auditLogs: AuditLogs;
   readonly payments: Payments;
   readonly billingPortalSessions: BillingPortalSessions;
@@ -81,6 +83,7 @@ export class BillKit {
     this.coupons = new Coupons(transport);
     this.taxRates = new TaxRates(transport);
     this.invoices = new Invoices(transport);
+    this.creditNotes = new CreditNotes(transport);
     this.auditLogs = new AuditLogs(transport);
     this.payments = new Payments(transport);
     this.billingPortalSessions = new BillingPortalSessions(transport);

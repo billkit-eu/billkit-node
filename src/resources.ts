@@ -566,6 +566,23 @@ export interface AuditLogsListParams extends BaseListParams {
   actor_id?: string;
 }
 
+/**
+ * `creditNotes.list` params.
+ *
+ * `invoice_id` answers "was this sale credited, and by how much", which is
+ * the question when reconciling one invoice; `customer_id` answers it for
+ * everything credited back to one buyer.
+ */
+export interface CreditNotesListParams extends BaseListParams {
+  invoice_id?: string;
+  customer_id?: string;
+}
+
+/** `invoices.void` params. `reason` is recorded on the audit row only. */
+export interface VoidInvoiceParams extends IdempotencyOptions {
+  reason?: string;
+}
+
 export interface CreateBillingPortalSessionParams extends IdempotencyOptions {
   subscription_id: string;
   return_url: string;
@@ -1353,6 +1370,63 @@ export class Invoices extends BaseResource {
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
     return paginate<T>((p) => this.get("/v1/invoices", p), { pageSize: options.pageSize });
+  }
+
+  /**
+   * Void an invoice: state that the sale was never owed.
+   *
+   * The invoice keeps its number and stays readable — a gapless series
+   * cannot lose a row — and stops being a receivable. Use it for an
+   * invoice that should not have been issued.
+   *
+   * A **paid** invoice is refused with a `ConflictError` whose `code` is
+   * `"invoice_not_voidable"`. That is deliberate rather than a
+   * limitation: once the money has moved, "never owed" is false, and the
+   * document that reverses a real sale is a credit note — refund the
+   * payment and one is issued when the refund settles.
+   *
+   * Idempotent: re-voiding an already-void invoice returns it unchanged.
+   */
+  void<T = unknown>(id: string, params: VoidInvoiceParams = {}): Promise<T> {
+    return this.post<T, VoidInvoiceParams>(`/v1/invoices/${id}/void`, params);
+  }
+}
+
+/**
+ * Read-only access to credit notes — the documents that reverse an
+ * issued invoice.
+ *
+ * There is no create: a credit note is issued for you when a refund
+ * settles, never on request, so that a numbered legal record is only
+ * minted once the money has actually moved. A refund that is still
+ * pending, one that fails, and a refund of a one-off charge that was
+ * never invoiced all produce none.
+ */
+export class CreditNotes extends BaseResource {
+  retrieve<T = unknown>(id: string): Promise<T> {
+    return this.get<T>(`/v1/credit_notes/${id}`);
+  }
+
+  /**
+   * Download the rendered credit note PDF as raw bytes. Same storage
+   * split as {@link Invoices.retrievePdf}: bytes inline or a followed
+   * `302`, and `501 rendering_pending` on a deployment with no renderer.
+   */
+  retrievePdf(id: string): Promise<ArrayBuffer> {
+    return this.t.requestBinary({ method: "GET", path: `/v1/credit_notes/${id}/pdf` });
+  }
+
+  list<T = unknown>(params: CreditNotesListParams = {}): Promise<ListResponseEnvelope<T>> {
+    return this.get<ListResponseEnvelope<T>>("/v1/credit_notes", params);
+  }
+
+  iter<T = unknown>(
+    options: { pageSize?: number; invoice_id?: string; customer_id?: string } = {},
+  ): AsyncIterableIterator<T> {
+    return paginate<T>((p) => this.get("/v1/credit_notes", p), {
+      pageSize: options.pageSize,
+      filters: { invoice_id: options.invoice_id, customer_id: options.customer_id },
+    });
   }
 }
 

@@ -118,6 +118,28 @@ export const mollie = {
     });
     if (!res.ok) throw new Error(`mollie refund_status failed: ${res.status} ${await res.text()}`);
   },
+
+  /**
+   * Settle every refund the fake holds against one payment.
+   *
+   * Takes the **provider** payment id (`tr_…`, what `settle()` takes), not
+   * BillKit's own `pay_…`. The form a suite can actually reach: BillKit
+   * deliberately never returns `provider_refund_id`, so a spec that booked a
+   * refund through the real route has no handle on the Mollie row it
+   * produced. The API answers 400 rather than succeeding vacuously when the
+   * payment has no fake refunds, so a mis-wired call fails loudly instead of
+   * reporting a settlement that never happened.
+   */
+  async settleRefundsFor(
+    providerPaymentId: string,
+    status: "refunded" | "failed" = "refunded",
+  ) {
+    const res = await post("/v1/console/auth/_test/mollie/refund_status", {
+      payment_id: providerPaymentId,
+      status,
+    });
+    if (!res.ok) throw new Error(`mollie refund_status failed: ${res.status} ${await res.text()}`);
+  },
 };
 
 /**
