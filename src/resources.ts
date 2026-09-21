@@ -1167,8 +1167,23 @@ export class WebhookEndpoints extends BaseResource {
   }
 
   /** Fetch one delivery row for inspection before deciding to redeliver. */
-  getDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
+  retrieveDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
     return this.get<T>(`/v1/webhook_endpoints/${endpointId}/deliveries/${deliveryId}`);
+  }
+
+  /**
+   * @deprecated Renamed to {@link WebhookEndpoints.retrieveDelivery}.
+   *
+   * Every other single-row fetch in every BillKit SDK is `retrieve`; this
+   * one method was `get`, which meant reaching for the obvious name and
+   * getting a type error. The python and php clients already spell it
+   * `retrieve_delivery` / `retrieveDelivery`, so node was the outlier.
+   *
+   * Kept as an alias because removing it would break callers for a naming
+   * preference. It will go in the next major.
+   */
+  getDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
+    return this.retrieveDelivery<T>(endpointId, deliveryId);
   }
 
   /**

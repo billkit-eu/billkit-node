@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [0.5.0] - 2026-09-22
+
+### Changed
+- `webhookEndpoints.getDelivery()` is now `retrieveDelivery()`. Every other
+  single-row fetch in every BillKit SDK is `retrieve`, and python and php
+  already spelled this one `retrieve_delivery` / `retrieveDelivery`, so node
+  was the outlier and the obvious name was a type error. `getDelivery` stays as
+  a deprecated alias — removing it would break callers over a naming
+  preference — and goes in the next major.
+
+### Fixed
+- `CustomerListParams` is exported from the package entry point. The interface
+  documented the `provisional` filter but could not be imported, so callers
+  building the params object ahead of the call had nothing to type it with.
+
 ## [0.4.0]
 
 ### Added

@@ -92,19 +92,21 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 
 | Accessor | Verbs |
 | --- | --- |
-| `client.customers` | `create`, `retrieve`, `update`, `delete`, `list`, `iter` |
+| `client.customers` | `create`, `retrieve`, `update`, `delete`, `list` (filter by `provisional`), `iter`, `setVatNumber`, `purge` |
 | `client.products` | `create`, `retrieve`, `update` (archive with `active: false`), `list`, `iter` |
 | `client.prices` | `create`, `retrieve`, `update` (archive with `active: false`, restore with `active: true`), `list`, `iter` |
 | `client.checkoutSessions` | `create`, `retrieve` |
 | `client.oneShotPayments` | `create`, `retrieve` |
 | `client.subscriptions` | `retrieve`, `list`, `iter` (filter by `customer_id`, `status`, `renewal_state`), `cancel`, `pause`, `resume`, `reactivate`, `previewUpdate`, `update`, `reauthorizePaymentMethod`, `createUsageRecord`, `listUsageRecords`, `iterUsageRecords`, `retrieveUsageSummary` |
 | `client.refunds` | `create`, `retrieve`, `list`, `iter` |
-| `client.webhookEndpoints` | `create`, `retrieve`, `update` (stop delivery with `status: "disabled"`), `delete`, `rotateSecret`, `list`, `iter`, `listDeliveries`, `iterDeliveries`, `getDelivery`, `redeliver` |
+| `client.disputes` | `retrieve`, `list`, `iter` |
+| `client.webhookEndpoints` | `create`, `retrieve`, `update` (stop delivery with `status: "disabled"`), `delete`, `rotateSecret`, `list`, `iter`, `listDeliveries`, `iterDeliveries`, `retrieveDelivery`, `redeliver` |
 | `client.events` | `retrieve`, `list`, `iter` (filter by `type`) |
 | `client.tenant` | `capabilities`, `portalBranding`, `setPortalBranding`, `rotateProviderCredential` |
 | `client.coupons` | `create`, `retrieve`, `update` (withdraw with `active: false`), `validate`, `list`, `iter` |
 | `client.taxRates` | `create`, `retrieve`, `update` (retire with `active: false`), `list`, `iter` |
-| `client.invoices` | `retrieve`, `retrievePdf`, `list`, `iter` |
+| `client.invoices` | `retrieve`, `retrievePdf`, `list`, `iter`, `void` |
+| `client.creditNotes` | `retrieve`, `retrievePdf`, `list`, `iter` (filter by `invoice_id`, `customer_id`) |
 | `client.auditLogs` | `retrieve`, `list`, `iter` (filter by `action`, `resource_type`, `actor_id`) |
 | `client.payments` | `retrieve`, `list`, `iter` |
 | `client.billingPortalSessions` | `create`, `revoke` |
@@ -225,14 +227,16 @@ const session = await client.checkoutSessions.create<{ client_secret: string }>(
 });
 ```
 
-### Invoice PDFs
+### Invoice and credit-note PDFs
 
 ```ts
 const pdf = await client.invoices.retrievePdf("inv_123");
 await writeFile("invoice.pdf", Buffer.from(pdf));
+
+const credit = await client.creditNotes.retrievePdf("cn_123");
 ```
 
-Returns the raw bytes. S3-backed deployments answer with a redirect to a presigned URL, which is followed transparently under the SDK's own timeout and retry policy, so both storage adapters look the same from here. A deployment with PDF rendering disabled throws a `ServerError` with `code: "rendering_pending"`; `retrieve()` still gives you the structured invoice to render yourself.
+Returns the raw bytes. S3-backed deployments answer with a redirect to a presigned URL, which is followed transparently under the SDK's own timeout and retry policy, so both storage adapters look the same from here — and the API key is never sent to the storage host, because the presigned URL carries its own credential. A deployment with PDF rendering disabled throws a `ServerError` with `code: "rendering_pending"`; `retrieve()` still gives you the structured document to render yourself.
 
 ## Auto-pagination
 

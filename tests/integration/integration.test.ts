@@ -27,7 +27,10 @@ import {
   InvalidRequestError,
   PermissionError,
   ResourceMissingError,
+  ServerError,
 } from "../../src/errors.js";
+import type { CustomerListParams } from "../../src/resources.js";
+import { Transport } from "../../src/transport.js";
 import { verifyWebhookSignature, WebhookVerificationError } from "../../src/webhooks.js";
 import {
   BASE_URL,
@@ -458,6 +461,32 @@ d("BillKit node SDK against a live API", () => {
         expect((err as InvalidRequestError).param).toBe("status");
       },
     );
+
+    scenario(
+      "filters.customer_provisional",
+      "provisional separates buyers from abandoned carts",
+      async () => {
+        // A checkout that captures an email commits its Customer *before*
+        // the charge, so a checkout nobody finished leaves a row behind.
+        // `provisional` is the only thing that tells the two apart, and a
+        // fresh tenant is what makes the assertion exact.
+        const t = await provisionTenant("provisional");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const created = await c.customers.create<{ id: string }>({
+          email: `buyer-${idemKey()}@example.com`,
+        });
+
+        const ids = async (params: CustomerListParams) =>
+          (await c.customers.list<{ id: string }>(params)).data?.map((row) => row.id) ?? [];
+
+        expect(await ids({ provisional: false })).toContain(created.id);
+        expect(await ids({ provisional: true })).not.toContain(created.id);
+        // Omitted means both kinds, which is why the filter has to be
+        // reachable at all: the default answer is not the one a "list my
+        // customers" screen wants.
+        expect(await ids({})).toContain(created.id);
+      },
+    );
   });
 
   // ── pagination ────────────────────────────────────────────────────
@@ -516,6 +545,42 @@ d("BillKit node SDK against a live API", () => {
         ).rejects.toBeInstanceOf(ConflictError);
       },
     );
+
+    scenario(
+      "idempotency.in_progress_converges",
+      "concurrent same-key creates all converge on one resource",
+      async () => {
+        // The contract a caller depends on: firing the same keyed create
+        // from N workers yields ONE resource and no exception.
+        //
+        // A request that arrives while the winner's handler is still
+        // running gets `409 idempotency_in_progress` — the one 4xx the
+        // client retries, because the charge may already have happened and
+        // the obvious workaround (retry with a fresh key) is what turns one
+        // charge into two. Whether any given attempt lands inside that
+        // window depends on the server's timing, so this can pass without
+        // entering it; what it can never do is pass while the client treats
+        // that 409 as terminal. The deterministic proof is in
+        // `tests/retry.test.ts`.
+        const t = await provisionTenant("inflight");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const key = idemKey();
+        const name = `Concurrent ${key}`;
+
+        const results = await Promise.all(
+          Array.from({ length: 8 }, () =>
+            c.products.create<{ id: string }>({ name, idempotencyKey: key }),
+          ),
+        );
+
+        const ids = new Set(results.map((r) => r.id));
+        expect(ids.size, "every attempt must resolve to the same product").toBe(1);
+
+        // And the server really did create only one row.
+        const page = await c.products.list<{ id: string; name: string }>({ limit: 100 });
+        expect((page.data ?? []).filter((row) => row.name === name)).toHaveLength(1);
+      },
+    );
   });
 
   // ── errors ────────────────────────────────────────────────────────
@@ -547,6 +612,34 @@ d("BillKit node SDK against a live API", () => {
         expect(err).toBeInstanceOf(InvalidRequestError);
         expect((err as InvalidRequestError).param).toBe("currency");
         expect((err as InvalidRequestError).code).toBe("parameter_invalid");
+      },
+    );
+
+    scenario(
+      "errors.status_drives_class",
+      "a 4xx the API labels `api_error` still maps on its status",
+      async () => {
+        // Not a contrived body: every request that never reaches a route
+        // handler is serialised by the API's framework-level handler as
+        // `{"type": "api_error", "code": "unhandled"}` with the original
+        // 4xx status. Mapping on `type` made a plain 404 — a typo'd id, an
+        // SDK/API version skew — arrive as ServerError, which is the class
+        // retry and alerting policies key on.
+        //
+        // Driven through the Transport rather than a resource because
+        // that is what a version skew looks like: the SDK asking for a
+        // route this API does not have.
+        const transport = new Transport({ apiKey: tenant.apiKey, baseUrl: BASE_URL });
+        const err = await transport
+          .request({ method: "GET", path: "/v1/no_such_resource" })
+          .catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(ResourceMissingError);
+        expect(err).not.toBeInstanceOf(ServerError);
+        // The envelope value is still carried verbatim; it just does not
+        // choose the class.
+        expect((err as ResourceMissingError).type).toBe("api_error");
+        expect((err as ResourceMissingError).statusCode).toBe(404);
       },
     );
   });

@@ -82,6 +82,7 @@ export type {
   CreateUsageRecordParams,
   CreateWebhookEndpointParams,
   CreditNotesListParams,
+  CustomerListParams,
   EventsListParams,
   IdempotencyOptions,
   ListParams,

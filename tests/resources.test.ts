@@ -538,13 +538,23 @@ describe("WebhookEndpoints deliveries", () => {
     expect(url.searchParams.get("limit")).toBe("25");
   });
 
-  it("getDelivery fetches one row", async () => {
+  it("retrieveDelivery fetches one row", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "wde_1" } }]);
+    await client(fetchImpl).webhookEndpoints.retrieveDelivery("we_1", "wde_1");
+    expect(calls[0]?.url).toBe(
+      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/wde_1",
+    );
+    expect(calls[0]?.method).toBe("GET");
+  });
+
+  it("getDelivery is still an alias for retrieveDelivery", async () => {
+    // Kept because removing it would break callers for a naming
+    // preference. Same request on the wire, so the alias cannot drift.
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "wde_1" } }]);
     await client(fetchImpl).webhookEndpoints.getDelivery("we_1", "wde_1");
     expect(calls[0]?.url).toBe(
       "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/wde_1",
     );
-    expect(calls[0]?.method).toBe("GET");
   });
 
   it("redeliver re-enqueues a row idempotently", async () => {
