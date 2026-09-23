@@ -257,7 +257,9 @@ export interface CreatePriceParams extends IdempotencyOptions {
   metadata?: Record<string, string>;
   trial_days?: number;
   trial_verification_cents?: number;
-  payment_methods?: Array<"creditcard" | "directdebit" | "ideal" | "applepay" | (string & {})>;
+  payment_methods?: Array<
+    "creditcard" | "directdebit" | "ideal" | "eps" | "applepay" | "paypal" | (string & {})
+  >;
   /**
    * What a cancellation refunds without being asked. `"none"` (the default)
    * nothing; `"full"` the whole last charge; `"prorated"` the unused part
@@ -371,8 +373,21 @@ export interface CreateCheckoutSessionParams extends IdempotencyOptions {
    * Pin the Mollie payment method. `undefined` lets Mollie pick from
    * the customer's available methods; when set, must be in the price's
    * `payment_methods` allowlist.
+   *
+   * Subscription-starting only, so this is deliberately NARROWER than the
+   * one-shot union: `bancontact` and `banktransfer` are absent because
+   * neither can mint the mandate a renewal needs. Mollie refuses the
+   * latter outright with "The payment method does not support sequence
+   * type".
    */
-  method?: "creditcard" | "directdebit" | "ideal" | "applepay" | (string & {});
+  method?:
+    | "creditcard"
+    | "directdebit"
+    | "ideal"
+    | "eps"
+    | "applepay"
+    | "paypal"
+    | (string & {});
   /** Optional coupon code applied at checkout; atomically claimed. */
   coupon_code?: string;
   /**
@@ -430,8 +445,12 @@ export interface CreateOneShotPaymentParams extends IdempotencyOptions {
   /**
    * Concrete Mollie method to charge with. Required, because a one-shot commits
    * up front). Validated against the tenant's capability allowlist for
-   * `currency`; one-off methods like `bancontact`/`eps` are allowed here
-   * even though they can't back a subscription.
+   * `currency`; one-off methods like `bancontact` and `banktransfer` are
+   * allowed here even though they can't back a subscription.
+   *
+   * `banktransfer` settles in DAYS, not seconds: the payer is handed bank
+   * details and Mollie holds the payment `open` for about a fortnight. Expect
+   * `one_shot_payment.paid` long after the call returns.
    *
    * `giropay` was removed: the scheme shut down at the end of 2024 and the
    * server now 422s it. The `(string & {})` tail keeps this open on
@@ -446,6 +465,8 @@ export interface CreateOneShotPaymentParams extends IdempotencyOptions {
     | "bancontact"
     | "eps"
     | "applepay"
+    | "paypal"
+    | "banktransfer"
     | (string & {});
   /** Where Mollie returns the payer after the hosted checkout. */
   success_url: string;
@@ -560,9 +581,18 @@ export interface UpdateTaxRateParams extends IdempotencyOptions {
   active?: boolean;
 }
 
+/**
+ * `auditLogs.list` params. All four filters match exactly and combine.
+ *
+ * `resource_type` narrows to a kind (`"customer"`, `"price"`);
+ * `resource_id` narrows to one row, which is the "everything that ever
+ * happened to this customer" question an audit log mostly exists for.
+ * Pair them or use `resource_id` alone — ids are already unique.
+ */
 export interface AuditLogsListParams extends BaseListParams {
   action?: string;
   resource_type?: string;
+  resource_id?: string;
   actor_id?: string;
 }
 
@@ -1462,13 +1492,20 @@ export class AuditLogs extends BaseResource {
   }
 
   iter<T = unknown>(
-    options: { pageSize?: number; action?: string; resource_type?: string; actor_id?: string } = {},
+    options: {
+      pageSize?: number;
+      action?: string;
+      resource_type?: string;
+      resource_id?: string;
+      actor_id?: string;
+    } = {},
   ): AsyncIterableIterator<T> {
     return paginate<T>((p) => this.get("/v1/audit_logs", p), {
       pageSize: options.pageSize,
       filters: {
         action: options.action,
         resource_type: options.resource_type,
+        resource_id: options.resource_id,
         actor_id: options.actor_id,
       },
     });

@@ -29,7 +29,7 @@ import {
   ResourceMissingError,
   ServerError,
 } from "../../src/errors.js";
-import type { CustomerListParams } from "../../src/resources.js";
+import type { AuditLogsListParams, CustomerListParams } from "../../src/resources.js";
 import { Transport } from "../../src/transport.js";
 import { verifyWebhookSignature, WebhookVerificationError } from "../../src/webhooks.js";
 import {
@@ -485,6 +485,46 @@ d("BillKit node SDK against a live API", () => {
         // reachable at all: the default answer is not the one a "list my
         // customers" screen wants.
         expect(await ids({})).toContain(created.id);
+      },
+    );
+
+    scenario(
+      "filters.audit_resource_id",
+      "resource_id narrows the audit log to one row's history",
+      async () => {
+        // The question an audit log mostly exists for: everything that
+        // ever happened to *this* customer. It was reachable only from
+        // php, which forwards an array, while node and python named three
+        // of the API's four filters and omitted this one.
+        const t = await provisionTenant("audit-resource");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+        const subject = await c.customers.create<{ id: string }>({
+          email: `subject-${idemKey()}@example.com`,
+        });
+        // A second customer, so "only the subject's rows" is an assertion
+        // rather than a restatement of an empty tenant.
+        const other = await c.customers.create<{ id: string }>({
+          email: `other-${idemKey()}@example.com`,
+        });
+        await c.customers.update(subject.id, { name: "Renamed" });
+
+        const rows = async (params: AuditLogsListParams) =>
+          (await c.auditLogs.list<{ resource_id: string }>(params)).data ?? [];
+
+        const scoped = await rows({ resource_id: subject.id, limit: 100 });
+        expect(scoped.length).toBeGreaterThan(0);
+        expect(scoped.every((r) => r.resource_id === subject.id)).toBe(true);
+        expect(scoped.map((r) => r.resource_id)).not.toContain(other.id);
+
+        // Combines with resource_type rather than replacing it.
+        const narrowed = await rows({
+          resource_id: subject.id,
+          resource_type: "customer",
+          limit: 100,
+        });
+        expect(narrowed.length).toBeGreaterThan(0);
+        expect(narrowed.every((r) => r.resource_id === subject.id)).toBe(true);
       },
     );
   });
@@ -1018,6 +1058,168 @@ d("BillKit node SDK against a live API", () => {
         }),
       ).rejects.toBeInstanceOf(WebhookVerificationError);
     });
+  });
+
+  // ── methods ───────────────────────────────────────────────────────
+  //
+  // The two request surfaces take different method sets and this SDK
+  // hand-copies both as TypeScript unions. A union that lags the server
+  // is invisible at build time — the `(string & {})` tail keeps it
+  // compiling — so it has to be checked against the running API.
+
+  describe("methods", () => {
+    /**
+     * The vocabulary a *price* may offer. Mirrors the server's
+     * `RecurringMethod`, which is also what this SDK's checkout `method`
+     * union spells out.
+     */
+    const RECURRING = ["creditcard", "directdebit", "ideal", "eps", "applepay", "paypal"] as const;
+    /**
+     * The subset that can actually be a checkout's `method`, i.e. that
+     * Mollie will mint a mandate from at `sequenceType=first`.
+     *
+     * `directdebit` is the one member of `RECURRING` missing here, and the
+     * distinction is the whole point of this scenario: SEPA belongs in a
+     * price's allowlist because it is what the renewals settle on, but it
+     * can never be the FIRST charge — the mandate has to be minted by a
+     * card, iDEAL, EPS, Apple Pay or PayPal payment before anything can be
+     * collected over it.
+     */
+    const MANDATE_CREATING = ["creditcard", "ideal", "eps", "applepay", "paypal"] as const;
+    /** Everything a single `sequenceType=oneoff` charge may use. */
+    const ONE_SHOT = [...RECURRING, "bancontact", "banktransfer"] as const;
+
+    async function freshBuyer(c: BillKit) {
+      return c.customers.create<{ id: string }>({
+        email: `method-${idemKey()}@sdk-it.example.com`,
+        country_code: "AT",
+      });
+    }
+
+    scenario(
+      "methods.recurring_vocabulary",
+      "checkout takes every mandate-minting method and refuses the one-off-only ones",
+      async () => {
+        const t = await provisionTenant("methods-recurring");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const product = await c.products.create<{ id: string }>({ name: `Plan ${idemKey()}` });
+        const price = await c.prices.create<{ id: string }>({
+          product_id: product.id,
+          amount_cents: 2500,
+          currency: "EUR",
+          interval: "month",
+          // The allowlist has to name them too, or the refusal below is the
+          // price's and not the vocabulary's.
+          payment_methods: [...RECURRING],
+        });
+
+        const startCheckout = async (method: string) => {
+          // A customer each: an in-flight initial_checkout is guarded per
+          // customer, so reusing one would fail the second method for a
+          // reason that has nothing to do with its name.
+          const buyer = await freshBuyer(c);
+          return c.checkoutSessions.create<{ id: string }>({
+            customer_id: buyer.id,
+            price_id: price.id,
+            method,
+            success_url: "https://merchant.example.com/ok",
+            cancel_url: "https://merchant.example.com/cancel",
+          });
+        };
+
+        for (const method of MANDATE_CREATING) {
+          const session = await startCheckout(method);
+          expect(session.id, `${method} should start a checkout`).toBeTruthy();
+        }
+
+        // Two different refusals, and they come from two different layers.
+        //
+        // `directdebit` passes the request literal — it IS a RecurringMethod,
+        // and the price above offers it — and is refused by the service,
+        // because SEPA is what renewals settle on rather than something a
+        // buyer can pay with first.
+        //
+        // `bancontact` and `banktransfer` never reach the service: neither is
+        // in `RecurringMethod` at all, so the schema rejects them. Mollie
+        // refuses banktransfer outright anyway ("The payment method does not
+        // support sequence type").
+        //
+        // Both surface as the same exception, which is the contract this
+        // asserts; the reasons differ and are worth knowing when one fires.
+        for (const method of ["directdebit", "bancontact", "banktransfer"]) {
+          const err = await startCheckout(method).catch((e: unknown) => e);
+          expect(err, `${method} must not start a subscription`).toBeInstanceOf(
+            InvalidRequestError,
+          );
+        }
+      },
+    );
+
+    scenario(
+      "methods.one_shot_vocabulary",
+      "a one-off charge takes every method, banktransfer included, and refuses giropay",
+      async () => {
+        const t = await provisionTenant("methods-oneshot");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+        for (const method of ONE_SHOT) {
+          const buyer = await freshBuyer(c);
+          const charge = await c.oneShotPayments.create<{ id: string }>({
+            customer_id: buyer.id,
+            amount_cents: 2500,
+            currency: "EUR",
+            method,
+            success_url: "https://merchant.example.com/ok",
+          });
+          expect(charge.id, `${method} should take a one-off charge`).toBeTruthy();
+        }
+
+        // giropay shut down at the end of 2024. Its refusal is part of the
+        // contract, which is why it is asserted rather than just omitted.
+        const buyer = await freshBuyer(c);
+        const err = await c.oneShotPayments
+          .create({
+            customer_id: buyer.id,
+            amount_cents: 2500,
+            currency: "EUR",
+            method: "giropay",
+            success_url: "https://merchant.example.com/ok",
+          })
+          .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(InvalidRequestError);
+      },
+    );
+
+    scenario(
+      "methods.banktransfer_settles_in_days",
+      "a bank transfer is held open for a fortnight, so pending is not failure",
+      async () => {
+        const t = await provisionTenant("methods-banktransfer");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+        const make = async (method: string) => {
+          const buyer = await freshBuyer(c);
+          return c.oneShotPayments.create<{ expires_at: number }>({
+            customer_id: buyer.id,
+            amount_cents: 2500,
+            currency: "EUR",
+            method,
+            success_url: "https://merchant.example.com/ok",
+          });
+        };
+
+        const card = await make("creditcard");
+        const transfer = await make("banktransfer");
+
+        // Relative, not absolute: the window is copied from the provider's
+        // own answer rather than invented by BillKit, so pinning an exact
+        // number would assert the fake's arithmetic instead of the
+        // behaviour an integrator has to plan for.
+        expect(transfer.expires_at).toBeGreaterThan(card.expires_at);
+        const days = (transfer.expires_at - Math.floor(Date.now() / 1000)) / 86_400;
+        expect(days, "a bank transfer stays open for days, not minutes").toBeGreaterThan(5);
+      },
+    );
   });
 
   // ── parity gate ───────────────────────────────────────────────────

@@ -107,7 +107,7 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 | `client.taxRates` | `create`, `retrieve`, `update` (retire with `active: false`), `list`, `iter` |
 | `client.invoices` | `retrieve`, `retrievePdf`, `list`, `iter`, `void` |
 | `client.creditNotes` | `retrieve`, `retrievePdf`, `list`, `iter` (filter by `invoice_id`, `customer_id`) |
-| `client.auditLogs` | `retrieve`, `list`, `iter` (filter by `action`, `resource_type`, `actor_id`) |
+| `client.auditLogs` | `retrieve`, `list`, `iter` (filter by `action`, `resource_type`, `resource_id`, `actor_id`) |
 | `client.payments` | `retrieve`, `list`, `iter` |
 | `client.billingPortalSessions` | `create`, `revoke` |
 

@@ -1,6 +1,6 @@
 {
   "name": "@billkit-eu/sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Official Node.js SDK for BillKit: a Stripe-Billing-shape multi-tenant SaaS API on Mollie.",
   "type": "module",
   "main": "./dist/index.cjs",
