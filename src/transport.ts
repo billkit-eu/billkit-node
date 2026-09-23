@@ -26,10 +26,15 @@ export type QueryValue = string | number | boolean | null | undefined;
 export interface RequestOptions {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   path: string;
-  // Loosened from ``Record<string, QueryValue>`` so resource methods
-  // can pass a structurally-typed ``ListParams``-style object without
-  // a cast, since TS demands an index signature otherwise.
-  query?: { readonly [key: string]: QueryValue };
+  /**
+   * Query parameters, as a plain object. Typed this way rather than with
+   * an index signature because TypeScript only gives an implicit index
+   * signature to type aliases, so a closed `*ListParams` interface would
+   * need a cast at every call site. {@link buildUrl} does the pruning:
+   * `undefined` and `null` are dropped, an array is joined with commas
+   * (the API's `expand=a,b` shape), everything else is stringified.
+   */
+  query?: object;
   body?: Record<string, unknown> | undefined;
   idempotencyKey?: string | undefined;
   extraHeaders?: Record<string, string>;
@@ -104,10 +109,9 @@ function buildUrl(baseUrl: string, path: string, query: RequestOptions["query"])
   const normalised = path.startsWith("/") ? path : `/${path}`;
   const url = new URL(baseUrl.replace(/\/$/, "") + normalised);
   if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== null && v !== undefined) {
-        url.searchParams.set(k, String(v));
-      }
+    for (const [k, v] of Object.entries(query as Record<string, unknown>)) {
+      if (v === null || v === undefined) continue;
+      url.searchParams.set(k, Array.isArray(v) ? v.join(",") : String(v));
     }
   }
   return url.toString();
@@ -195,13 +199,20 @@ function retryDelayMs(
  * ``AbortSignal.timeout`` aborts with a ``TimeoutError`` (some runtimes
  * surface ``AbortError``); we translate that into an explicit, greppable
  * timeout message instead of the runtime's terse default.
+ *
+ * The original error is attached as ``cause`` either way. Node's fetch
+ * reports every transport failure as the same "fetch failed" message and
+ * puts the real reason (``ECONNREFUSED``, ``ENOTFOUND``, a TLS error) in
+ * its own cause, so dropping it left the caller with nothing to diagnose.
  */
 function connectionError(err: unknown, timeoutMs: number): APIConnectionError {
   const e = err as { name?: string; message?: string } | undefined;
   if (e?.name === "TimeoutError" || e?.name === "AbortError") {
-    return new APIConnectionError(`BillKit request timed out after ${timeoutMs}ms.`);
+    return new APIConnectionError(`BillKit request timed out after ${timeoutMs}ms.`, {
+      cause: err,
+    });
   }
-  return new APIConnectionError(e?.message ?? "Network request failed.");
+  return new APIConnectionError(e?.message ?? "Network request failed.", { cause: err });
 }
 
 export class Transport {

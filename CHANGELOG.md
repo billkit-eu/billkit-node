@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [0.7.0] - 2026-09-23
+
+### Fixed
+- `CreateCouponParams.discount_type` now types the API's two literals, `"percent"` and `"fixed_cents"`; it had offered `"percentage"` / `"amount"`, neither of which the API accepts.
+- Every path id is percent-encoded, so an id containing `/`, `?` or `#` can no longer rewrite the request onto a different route.
+- `APIConnectionError` carries the original fetch failure as `cause`, including on the timeout path, so Node's "fetch failed" no longer hides the real reason.
+- `BaseListParams` lost its index signature, so a misspelled filter is a compile error instead of a query parameter the server ignores. `ListParams` stays exported as a deprecated alias.
+
+### Added
+- `apiKeys` resource: `create`, `retrieve`, `revoke`, `list`, `iter`.
+- `invoices.sendEmail(id)` for `POST /v1/invoices/{id}/email`.
+- `payments.retrieveProvider(id)` for `GET /v1/payments/{id}/provider`.
+- `tenant.billingProfile()` / `tenant.setBillingProfile(params)` for the seller's country, VAT id and invoice address; an explicit `null` clears a field.
+- `tenant.export()` returns the account's full JSON export as raw bytes.
+- `webhookEndpoints.listEventTypes()` for the deliverable-event catalogue.
+- `expand?: string[]` on `customers.list`, `products.list`, `subscriptions.list`, `payments.list`, `invoices.list` and `events.list`, and as an optional second argument on `products.retrieve`, `subscriptions.retrieve`, `payments.retrieve` and `invoices.retrieve`.
+- `payments.list` types `customer_id`; `invoices.list` types `customer_id`, `subscription_id`, `payment_id` and `status`; `disputes.list` types `status` and `payment_id`. All are carried onto every page by `iter()`.
+- `CreateCheckoutSessionParams.country`, so VAT applies to the first charge on the hosted flow.
+- `CreateBillingPortalSessionParams.deliver_email`, which also emails the portal link to the customer.
+- New exported types: `CreateApiKeyParams`, `SetTenantBillingProfileParams`, `ExpandOptions`, `DisputesListParams`, `InvoicesListParams`, `PaymentsListParams`, `ProductsListParams`, `SetCustomerVatNumberParams`, `UpdatePriceParams`.
+
+### Changed
+- `UpdatePriceParams` accepts every field `PriceUpdate` does (`active`, `metadata`, `tax_behavior`, `payment_methods`, `refund_on_cancel`, `refund_window_initial_days`, `refund_window_renewal_days`), all optional, where `active` was previously required and alone.
+- `SetCustomerVatNumberParams.vat_number` is `string | null`; an explicit `null` clears the registration and is not pruned.
+- `billingPortalSessions.create` prunes undefined fields instead of sending a fixed body.
+
 ## [0.6.0] - 2026-09-23
 
 ### Added

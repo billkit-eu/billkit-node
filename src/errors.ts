@@ -26,6 +26,12 @@ export interface BillKitErrorOptions {
   statusCode?: number | undefined;
   requestId?: string | undefined;
   rawBody?: unknown;
+  /**
+   * The underlying error, forwarded to `Error`'s own `cause`. Set on
+   * `APIConnectionError` so the runtime's reason for a failed fetch
+   * (`ECONNREFUSED`, a TLS failure, an abort) survives the mapping.
+   */
+  cause?: unknown;
 }
 
 // TS treats `name = "Foo"` as a literal-type property, which then conflicts
@@ -41,7 +47,10 @@ export class BillKitError extends Error {
   readonly rawBody: unknown;
 
   constructor(message: string, options: BillKitErrorOptions = {}) {
-    super(message);
+    // Only pass the options bag when there is a cause: `{ cause: undefined }`
+    // still installs an own `cause` property, which would show up on every
+    // error that never had one.
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.type = options.type;
     this.code = options.code;
     this.param = options.param;

@@ -19,17 +19,18 @@
  */
 
 import { paginate, type ListResponseEnvelope } from "./pagination.js";
-import type { QueryValue, Transport } from "./transport.js";
+import type { Transport } from "./transport.js";
 
 // ─── Shared parameter shapes ───────────────────────────────────────
 
 /**
  * Cursor-pagination knobs shared by every `list()` method.
  *
- * The index signature is what lets a resource-specific extension
- * (e.g. `EventsListParams` adds `type?: string`) flow through the
- * Transport's `query` shape without a cast. Excess fields are
- * tolerated; `undefined` values are pruned before serialisation.
+ * Closed on purpose: there is no index signature, so a misspelled filter
+ * (`provisonal`) is a compile error instead of a query parameter the
+ * server ignores. The Transport takes `query` as a plain `object` and
+ * prunes/stringifies it, which is what lets these interfaces through
+ * without a cast.
  */
 export interface BaseListParams {
   limit?: number;
@@ -38,7 +39,15 @@ export interface BaseListParams {
   // `limit` + `starting_after` only (see `api/billkit/api/pagination.py`).
   // Advertising a backwards cursor the server ignores is worse than not
   // having one — the request succeeds and silently re-serves page 1.
-  readonly [key: string]: QueryValue;
+}
+
+/**
+ * `?expand=` on a single-object GET. The relations a route accepts differ
+ * per resource and are listed on each `retrieve()`; an unknown one is a
+ * `400` naming the ones that work.
+ */
+export interface ExpandOptions {
+  expand?: string[];
 }
 
 /**
@@ -49,6 +58,43 @@ export interface BaseListParams {
  */
 export interface PricesListParams extends BaseListParams {
   product_id?: string;
+}
+
+/**
+ * `payments.list` params. `customer_id` narrows to one customer's
+ * charges. Mandate verifications are never listed, so every row is a
+ * real purchase attempt; check `status` before treating one as revenue.
+ */
+export interface PaymentsListParams extends BaseListParams {
+  customer_id?: string;
+  /** Expandable here: `customer`, `subscription`. */
+  expand?: string[];
+}
+
+/**
+ * `invoices.list` params. The three id filters each narrow to one row's
+ * worth of invoices: `payment_id` answers "which invoice did this charge
+ * produce".
+ */
+export interface InvoicesListParams extends BaseListParams {
+  customer_id?: string;
+  subscription_id?: string;
+  payment_id?: string;
+  /** One of `draft`, `open`, `paid`, `void`, `uncollectible`. */
+  status?: string;
+  /** Expandable here: `customer`. */
+  expand?: string[];
+}
+
+/**
+ * `disputes.list` params. `status` takes a comma-separated list of `open`
+ * / `won`. There is no `lost`, because the provider gives no signal for
+ * one. `payment_id` matches subscription payments only, not one-off
+ * charges.
+ */
+export interface DisputesListParams extends BaseListParams {
+  status?: string;
+  payment_id?: string;
 }
 
 /**
@@ -70,6 +116,8 @@ export interface SubscriptionsListParams extends BaseListParams {
   status?: string;
   /** `auto_renew` | `paused` | `canceling` | `stopped`, CSV. */
   renewal_state?: string;
+  /** Expandable here: `customer`, `price`, `refund_eligibility`. */
+  expand?: string[];
 }
 
 /** Optional idempotency knob carried by every mutating call. */
@@ -81,12 +129,12 @@ export interface IdempotencyOptions {
   idempotencyKey?: string;
 }
 
-// Keep a type alias for backward compatibility with the previous
-// loosely-typed ListParams. New code should reach for the
-// resource-specific *ListParams (e.g. `EventsListParams`).
-export type ListParams = BaseListParams & {
-  readonly [key: string]: QueryValue;
-};
+/**
+ * @deprecated Alias of {@link BaseListParams}, kept for callers that
+ * imported the older name. Reach for the resource-specific `*ListParams`
+ * (e.g. `EventsListParams`) instead.
+ */
+export type ListParams = BaseListParams;
 
 // ─── Per-resource parameter shapes ─────────────────────────────────
 //
@@ -116,15 +164,27 @@ export interface CustomerListParams extends BaseListParams {
    * omitted for both.
    */
   provisional?: boolean;
+  /** Expandable here: `stats`. Sent as `expand=a,b`. */
+  expand?: string[];
+}
+
+/** Query parameters accepted by `GET /v1/products`. */
+export interface ProductsListParams extends BaseListParams {
+  /** Expandable here: `prices`, `stats`. */
+  expand?: string[];
 }
 
 /**
  * Body for `POST /v1/customers/{id}/vat_number`. The VAT number is
  * sent through VIES server-side; the response carries
  * `vat_number_validated` reflecting the outcome.
+ *
+ * `vat_number: null` **clears** the registration, and is sent as an
+ * explicit null rather than pruned: only `undefined` is dropped.
  */
 export interface SetCustomerVatNumberParams extends IdempotencyOptions {
-  vat_number: string;
+  vat_number: string | null;
+  /** VIES needs a country; send it when the customer has none yet. */
   country_code?: string;
 }
 
@@ -171,13 +231,36 @@ export interface UpdateProductParams extends IdempotencyOptions {
 }
 
 /**
- * Body for `POST /v1/prices/{id}`. `active` is the only field a price
- * accepts, and it moves both ways: `false` withdraws the price from sale,
- * `true` puts it back. The amount, currency and interval are fixed at
- * creation, so neither direction changes what anyone was charged.
+ * Body for `POST /v1/prices/{id}`. Every field is optional; omitted ones
+ * are left alone.
+ *
+ * The dividing line is what a field decides. `amount_cents`, `currency`,
+ * `interval` and `usage_type` decide **what a past charge was**, so they
+ * are fixed at creation and absent here, because subscriptions renew
+ * against a price by id and editing one would re-price live customers.
+ * Everything
+ * below decides **what happens next**, which is why it is editable:
+ * setting `refund_on_cancel` covers the customers already on the price.
+ *
+ * `tax_behavior` is the exception and moves one way. It can be set while
+ * the price is still `"unspecified"` and never changed again, because
+ * flipping it would restate whether tax was inside or on top of an amount
+ * somebody has already paid.
  */
 export interface UpdatePriceParams extends IdempotencyOptions {
-  active: boolean;
+  /** `false` withdraws the price from sale, `true` puts it back. */
+  active?: boolean;
+  metadata?: Record<string, string>;
+  /** Settable once, while the price is still `"unspecified"`. */
+  tax_behavior?: "inclusive" | "exclusive";
+  /** Read when a checkout opens. At least one entry. */
+  payment_methods?: Array<
+    "creditcard" | "directdebit" | "ideal" | "eps" | "applepay" | "paypal" | (string & {})
+  >;
+  refund_on_cancel?: "none" | "full" | "prorated";
+  /** `0` disables refunds for that charge type; `N > 0` is an N-day window. */
+  refund_window_initial_days?: number;
+  refund_window_renewal_days?: number;
 }
 
 /**
@@ -370,6 +453,14 @@ export interface CreateCheckoutSessionParams extends IdempotencyOptions {
   success_url: string;
   cancel_url: string;
   /**
+   * The buyer's ISO-3166-1 alpha-2 country, when you already know it.
+   * Stored on the customer if they do not have one yet, which is what
+   * lets VAT apply to the very first charge. On the hosted flow the buyer
+   * only reaches a country-collecting page after the charge exists.
+   * Never overwrites a country the customer already has.
+   */
+  country?: string;
+  /**
    * Pin the Mollie payment method. `undefined` lets Mollie pick from
    * the customer's available methods; when set, must be in the price's
    * `payment_methods` allowlist.
@@ -512,6 +603,8 @@ export interface UpdateWebhookEndpointParams extends IdempotencyOptions {
 export interface EventsListParams extends BaseListParams {
   /** Server-side filter, e.g. `customer.created`. */
   type?: string;
+  /** Expandable here: `customer`. `events.retrieve` accepts none. */
+  expand?: string[];
 }
 
 export interface SetPortalBrandingParams extends IdempotencyOptions {
@@ -533,7 +626,12 @@ export interface RotateProviderCredentialParams extends IdempotencyOptions {
 
 export interface CreateCouponParams extends IdempotencyOptions {
   code: string;
-  discount_type: "percentage" | "amount" | (string & {});
+  /**
+   * `"percent"` reads `discount_value` as whole percent; `"fixed_cents"`
+   * reads it as minor units off the charge. Those are the only two the
+   * API accepts (`schemas/coupon.py`); anything else is a `422`.
+   */
+  discount_type: "percent" | "fixed_cents" | (string & {});
   discount_value: number;
   duration: "once" | "repeating" | "forever" | (string & {});
   duration_in_months?: number;
@@ -608,6 +706,42 @@ export interface CreditNotesListParams extends BaseListParams {
   customer_id?: string;
 }
 
+/**
+ * Body for `POST /v1/tenant/billing_profile`: the seller identity that
+ * VAT is decided against and that an invoice prints.
+ *
+ * `country_code` is required on every call: there is nothing to leave
+ * alone about a jurisdiction. Every other field is partial-update: omit
+ * it to leave the stored value alone, or pass an explicit `null` to
+ * clear it, because ceasing to be VAT registered (or moving office) is a
+ * real event.
+ */
+export interface SetTenantBillingProfileParams extends IdempotencyOptions {
+  /** ISO-3166-1 alpha-2, e.g. `"NL"`. */
+  country_code: string;
+  /** Your own EU VAT registration, or `null` to clear it. */
+  vat_id?: string | null;
+  address_line1?: string | null;
+  address_line2?: string | null;
+  postal_code?: string | null;
+  city?: string | null;
+  registration_number?: string | null;
+}
+
+/**
+ * Body for `POST /v1/api_keys`. The full key is returned **once**, on the
+ * create response, and is never retrievable again.
+ */
+export interface CreateApiKeyParams extends IdempotencyOptions {
+  /** Human label, so a key can be identified before it is revoked. */
+  label?: string;
+  /**
+   * Narrow what the key may do. Omit to inherit the calling key's own
+   * scopes; a key can never grant more than it holds.
+   */
+  scopes?: string[];
+}
+
 /** `invoices.void` params. `reason` is recorded on the audit row only. */
 export interface VoidInvoiceParams extends IdempotencyOptions {
   reason?: string;
@@ -616,9 +750,28 @@ export interface VoidInvoiceParams extends IdempotencyOptions {
 export interface CreateBillingPortalSessionParams extends IdempotencyOptions {
   subscription_id: string;
   return_url: string;
+  /**
+   * Also email the portal link to the subscription's customer, at the
+   * address on their record, as a tenant-branded message. Defaults to
+   * `false`: without it you distribute the returned `url` yourself.
+   */
+  deliver_email?: boolean;
 }
 
 // ─── Internals ─────────────────────────────────────────────────────
+
+/**
+ * Percent-encode a caller-supplied id before it becomes a path segment.
+ *
+ * Ids reach the SDK from the caller's own storage, and one carrying `/`,
+ * `?` or `#` would otherwise rewrite the request: `#` truncates the path,
+ * `?` turns the tail into a query string, and `/` walks to a different
+ * route entirely. Encoding keeps the request on the route the method
+ * names, so a bad id is a clean `404` rather than a call somewhere else.
+ */
+function p(id: string): string {
+  return encodeURIComponent(id);
+}
 
 function dropUndefined<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -683,7 +836,13 @@ function assertPriceRatesAreStrings(params: CreatePriceParams): CreatePriceParam
 abstract class BaseResource {
   constructor(protected readonly t: Transport) {}
 
-  protected get<T>(path: string, query?: BaseListParams & Record<string, QueryValue>): Promise<T> {
+  /**
+   * `query` is a plain object rather than an index-signature type: TypeScript
+   * only gives an implicit index signature to type *aliases*, so a closed
+   * `*ListParams` interface would otherwise need a cast at every call site.
+   * The transport prunes `undefined`/`null` and joins arrays with commas.
+   */
+  protected get<T>(path: string, query?: object): Promise<T> {
     return this.t.request<T>({ method: "GET", path, query });
   }
 
@@ -735,11 +894,11 @@ export class Customers extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/customers/${id}`);
+    return this.get<T>(`/v1/customers/${p(id)}`);
   }
 
   update<T = unknown>(id: string, params: UpdateCustomerParams = {}): Promise<T> {
-    return this.post<T, UpdateCustomerParams>(`/v1/customers/${id}`, params);
+    return this.post<T, UpdateCustomerParams>(`/v1/customers/${p(id)}`, params);
   }
 
   /**
@@ -753,7 +912,7 @@ export class Customers extends BaseResource {
    * charge them.
    */
   delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/customers/${id}`, params);
+    return this.del<T>(`/v1/customers/${p(id)}`, params);
   }
 
   /**
@@ -772,7 +931,7 @@ export class Customers extends BaseResource {
 
   /** Walk every page of `list()` and yield each customer. */
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/customers", p), { pageSize: options.pageSize });
+    return paginate<T>((page) => this.get("/v1/customers", page), { pageSize: options.pageSize });
   }
 
   /**
@@ -781,7 +940,7 @@ export class Customers extends BaseResource {
    * reflecting whether VIES confirmed the number.
    */
   setVatNumber<T = unknown>(id: string, params: SetCustomerVatNumberParams): Promise<T> {
-    return this.post<T, SetCustomerVatNumberParams>(`/v1/customers/${id}/vat_number`, params);
+    return this.post<T, SetCustomerVatNumberParams>(`/v1/customers/${p(id)}/vat_number`, params);
   }
 
   /**
@@ -794,7 +953,7 @@ export class Customers extends BaseResource {
    */
   purge<T = unknown>(id: string, params: PurgeCustomerParams = {}): Promise<T> {
     const { confirmed = true, idempotencyKey } = params;
-    return this.postFixed<T>(`/v1/customers/${id}/purge`, { confirmed }, { idempotencyKey });
+    return this.postFixed<T>(`/v1/customers/${p(id)}/purge`, { confirmed }, { idempotencyKey });
   }
 }
 
@@ -804,8 +963,9 @@ export class Products extends BaseResource {
     return this.post<T, CreateProductParams>("/v1/products", params);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/products/${id}`);
+  /** Expandable: `prices` (every price on the product), `stats`. */
+  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
+    return this.get<T>(`/v1/products/${p(id)}`, options);
   }
 
   /**
@@ -818,15 +978,15 @@ export class Products extends BaseResource {
    * `active: true` un-archives.
    */
   update<T = unknown>(id: string, params: UpdateProductParams): Promise<T> {
-    return this.post<T, UpdateProductParams>(`/v1/products/${id}`, params);
+    return this.post<T, UpdateProductParams>(`/v1/products/${p(id)}`, params);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  list<T = unknown>(params: ProductsListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/products", params);
   }
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/products", p), { pageSize: options.pageSize });
+    return paginate<T>((page) => this.get("/v1/products", page), { pageSize: options.pageSize });
   }
 }
 
@@ -851,7 +1011,7 @@ export class Prices extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/prices/${id}`);
+    return this.get<T>(`/v1/prices/${p(id)}`);
   }
 
   /**
@@ -875,7 +1035,7 @@ export class Prices extends BaseResource {
    * `price.archived`; putting one back emits `price.updated`.
    */
   update<T = unknown>(id: string, params: UpdatePriceParams): Promise<T> {
-    return this.post<T, UpdatePriceParams>(`/v1/prices/${id}`, params);
+    return this.post<T, UpdatePriceParams>(`/v1/prices/${p(id)}`, params);
   }
 
   list<T = unknown>(params: PricesListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -886,7 +1046,7 @@ export class Prices extends BaseResource {
     options: { pageSize?: number; product_id?: string } = {},
   ): AsyncIterableIterator<T> {
     const filter = options.product_id === undefined ? {} : { product_id: options.product_id };
-    return paginate<T>((p) => this.get("/v1/prices", { ...filter, ...p }), {
+    return paginate<T>((page) => this.get("/v1/prices", { ...filter, ...page }), {
       pageSize: options.pageSize,
     });
   }
@@ -898,7 +1058,7 @@ export class CheckoutSessions extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/checkout/sessions/${id}`);
+    return this.get<T>(`/v1/checkout/sessions/${p(id)}`);
   }
 }
 
@@ -918,13 +1078,14 @@ export class OneShotPayments extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/checkout/one_shot/${id}`);
+    return this.get<T>(`/v1/checkout/one_shot/${p(id)}`);
   }
 }
 
 export class Subscriptions extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/subscriptions/${id}`);
+  /** Expandable: `customer`, `price`, `refund_eligibility`. */
+  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
+    return this.get<T>(`/v1/subscriptions/${p(id)}`, options);
   }
 
   /**
@@ -953,19 +1114,19 @@ export class Subscriptions extends BaseResource {
     // `undefined` query values are pruned by the transport, so the
     // filter can be spread as-is without a conditional per key.
     const { pageSize, ...filter } = options;
-    return paginate<T>((p) => this.get("/v1/subscriptions", { ...filter, ...p }), { pageSize });
+    return paginate<T>((page) => this.get("/v1/subscriptions", { ...filter, ...page }), { pageSize });
   }
 
   cancel<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${id}/cancel`, params);
+    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/cancel`, params);
   }
 
   pause<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${id}/pause`, params);
+    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/pause`, params);
   }
 
   resume<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${id}/resume`, params);
+    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/resume`, params);
   }
 
   /**
@@ -977,11 +1138,11 @@ export class Subscriptions extends BaseResource {
    * Returns `409` if the period has already elapsed.
    */
   reactivate<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${id}/reactivate`, params);
+    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/reactivate`, params);
   }
 
   previewUpdate<T = unknown>(id: string, params: { target_price_id: string }): Promise<T> {
-    return this.postFixed<T>(`/v1/subscriptions/${id}/preview_update`, {
+    return this.postFixed<T>(`/v1/subscriptions/${p(id)}/preview_update`, {
       target_price_id: params.target_price_id,
     });
   }
@@ -991,7 +1152,7 @@ export class Subscriptions extends BaseResource {
     params: { target_price_id: string } & IdempotencyOptions,
   ): Promise<T> {
     return this.postFixed<T>(
-      `/v1/subscriptions/${id}/update`,
+      `/v1/subscriptions/${p(id)}/update`,
       { target_price_id: params.target_price_id },
       { idempotencyKey: params.idempotencyKey },
     );
@@ -1002,7 +1163,7 @@ export class Subscriptions extends BaseResource {
     params: { return_url: string } & IdempotencyOptions,
   ): Promise<T> {
     return this.postFixed<T>(
-      `/v1/subscriptions/${id}/reauthorize_payment_method`,
+      `/v1/subscriptions/${p(id)}/reauthorize_payment_method`,
       { return_url: params.return_url },
       { idempotencyKey: params.idempotencyKey },
     );
@@ -1025,7 +1186,7 @@ export class Subscriptions extends BaseResource {
    * See {@link CreateUsageRecordParams.identifier}.
    */
   createUsageRecord<T = unknown>(id: string, params: CreateUsageRecordParams): Promise<T> {
-    return this.post<T, CreateUsageRecordParams>(`/v1/subscriptions/${id}/usage_records`, params);
+    return this.post<T, CreateUsageRecordParams>(`/v1/subscriptions/${p(id)}/usage_records`, params);
   }
 
   /**
@@ -1039,7 +1200,7 @@ export class Subscriptions extends BaseResource {
     id: string,
     params: UsageRecordsListParams = {},
   ): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>(`/v1/subscriptions/${id}/usage_records`, params);
+    return this.get<ListResponseEnvelope<T>>(`/v1/subscriptions/${p(id)}/usage_records`, params);
   }
 
   /** Walk every page of `listUsageRecords()` for one subscription. */
@@ -1047,7 +1208,7 @@ export class Subscriptions extends BaseResource {
     id: string,
     options: { pageSize?: number; invoice_id?: string } = {},
   ): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get(`/v1/subscriptions/${id}/usage_records`, p), {
+    return paginate<T>((page) => this.get(`/v1/subscriptions/${p(id)}/usage_records`, page), {
       pageSize: options.pageSize,
       filters: { invoice_id: options.invoice_id },
     });
@@ -1072,7 +1233,7 @@ export class Subscriptions extends BaseResource {
    * unsettled; while one is open, this period cannot be charged.
    */
   retrieveUsageSummary<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/subscriptions/${id}/usage_summary`);
+    return this.get<T>(`/v1/subscriptions/${p(id)}/usage_summary`);
   }
 }
 
@@ -1082,7 +1243,7 @@ export class Refunds extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/refunds/${id}`);
+    return this.get<T>(`/v1/refunds/${p(id)}`);
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1090,7 +1251,7 @@ export class Refunds extends BaseResource {
   }
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/refunds", p), { pageSize: options.pageSize });
+    return paginate<T>((page) => this.get("/v1/refunds", page), { pageSize: options.pageSize });
   }
 }
 
@@ -1105,25 +1266,41 @@ export class Refunds extends BaseResource {
  */
 export class Disputes extends BaseResource {
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/disputes/${id}`);
+    return this.get<T>(`/v1/disputes/${p(id)}`);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  list<T = unknown>(params: DisputesListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/disputes", params);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/disputes", p), { pageSize: options.pageSize });
+  iter<T = unknown>(
+    options: { pageSize?: number; status?: string; payment_id?: string } = {},
+  ): AsyncIterableIterator<T> {
+    return paginate<T>((page) => this.get("/v1/disputes", page), {
+      pageSize: options.pageSize,
+      filters: { status: options.status, payment_id: options.payment_id },
+    });
   }
 }
 
 export class WebhookEndpoints extends BaseResource {
+  /**
+   * Every event type this deployment can deliver, plus the wildcard.
+   *
+   * `enabled_events` rejects anything not on this list, so read it rather
+   * than hard-coding a set: a name that is not on it fails at
+   * registration and leaves you with an endpoint that never fires.
+   */
+  listEventTypes<T = unknown>(): Promise<T> {
+    return this.get<T>("/v1/webhook_endpoints/event_types");
+  }
+
   create<T = unknown>(params: CreateWebhookEndpointParams): Promise<T> {
     return this.post<T, CreateWebhookEndpointParams>("/v1/webhook_endpoints", params);
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/webhook_endpoints/${id}`);
+    return this.get<T>(`/v1/webhook_endpoints/${p(id)}`);
   }
 
   /**
@@ -1135,7 +1312,7 @@ export class WebhookEndpoints extends BaseResource {
    * disabling is reversible and deleting is not.
    */
   update<T = unknown>(id: string, params: UpdateWebhookEndpointParams): Promise<T> {
-    return this.post<T, UpdateWebhookEndpointParams>(`/v1/webhook_endpoints/${id}`, params);
+    return this.post<T, UpdateWebhookEndpointParams>(`/v1/webhook_endpoints/${p(id)}`, params);
   }
 
   /**
@@ -1150,12 +1327,12 @@ export class WebhookEndpoints extends BaseResource {
    * were sent stays on record.
    */
   delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/webhook_endpoints/${id}`, params);
+    return this.del<T>(`/v1/webhook_endpoints/${p(id)}`, params);
   }
 
   /** Rotate the signing secret. The new `bkwhsec_...` is returned once. */
   rotateSecret<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/webhook_endpoints/${id}/rotate_secret`, params);
+    return this.postEmpty<T>(`/v1/webhook_endpoints/${p(id)}/rotate_secret`, params);
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1163,7 +1340,7 @@ export class WebhookEndpoints extends BaseResource {
   }
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/webhook_endpoints", p), {
+    return paginate<T>((page) => this.get("/v1/webhook_endpoints", page), {
       pageSize: options.pageSize,
     });
   }
@@ -1180,7 +1357,7 @@ export class WebhookEndpoints extends BaseResource {
     params: BaseListParams = {},
   ): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>(
-      `/v1/webhook_endpoints/${endpointId}/deliveries`,
+      `/v1/webhook_endpoints/${p(endpointId)}/deliveries`,
       params,
     );
   }
@@ -1191,14 +1368,14 @@ export class WebhookEndpoints extends BaseResource {
     options: { pageSize?: number } = {},
   ): AsyncIterableIterator<T> {
     return paginate<T>(
-      (p) => this.get(`/v1/webhook_endpoints/${endpointId}/deliveries`, p),
+      (page) => this.get(`/v1/webhook_endpoints/${p(endpointId)}/deliveries`, page),
       { pageSize: options.pageSize },
     );
   }
 
   /** Fetch one delivery row for inspection before deciding to redeliver. */
   retrieveDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
-    return this.get<T>(`/v1/webhook_endpoints/${endpointId}/deliveries/${deliveryId}`);
+    return this.get<T>(`/v1/webhook_endpoints/${p(endpointId)}/deliveries/${p(deliveryId)}`);
   }
 
   /**
@@ -1229,7 +1406,7 @@ export class WebhookEndpoints extends BaseResource {
     params: IdempotencyOptions = {},
   ): Promise<T> {
     return this.postEmpty<T>(
-      `/v1/webhook_endpoints/${endpointId}/deliveries/${deliveryId}/redeliver`,
+      `/v1/webhook_endpoints/${p(endpointId)}/deliveries/${p(deliveryId)}/redeliver`,
       params,
     );
   }
@@ -1237,7 +1414,7 @@ export class WebhookEndpoints extends BaseResource {
 
 export class Events extends BaseResource {
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/events/${id}`);
+    return this.get<T>(`/v1/events/${p(id)}`);
   }
 
   list<T = unknown>(params: EventsListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1248,7 +1425,7 @@ export class Events extends BaseResource {
   iter<T = unknown>(
     options: { pageSize?: number; type?: string } = {},
   ): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/events", p), {
+    return paginate<T>((page) => this.get("/v1/events", page), {
       pageSize: options.pageSize,
       filters: { type: options.type },
     });
@@ -1266,6 +1443,49 @@ export class Tenant extends BaseResource {
   /** Cached Mollie profile shape (enabled methods, country, currency). */
   capabilities<T = unknown>(): Promise<T> {
     return this.get<T>("/v1/tenant/capabilities");
+  }
+
+  /**
+   * Your registered country and VAT number: what your customers' VAT is
+   * decided against.
+   *
+   * `country_code` is what you have stored and can be `null`;
+   * `effective_country_code` is what the next charge will really use.
+   * The two differ only when you have stored nothing, which is exactly
+   * the case worth spotting before a first live payment.
+   */
+  billingProfile<T = unknown>(): Promise<T> {
+    return this.get<T>("/v1/tenant/billing_profile");
+  }
+
+  /**
+   * Set the seller identity. `country_code` is required on every call;
+   * every other field is partial-update, with an explicit `null` to
+   * clear. Changes take effect on the next charge only. Tax is written
+   * onto a payment and its invoice before money moves, and nothing goes
+   * back and recalculates it.
+   */
+  setBillingProfile<T = unknown>(params: SetTenantBillingProfileParams): Promise<T> {
+    return this.post<T, SetTenantBillingProfileParams>("/v1/tenant/billing_profile", params);
+  }
+
+  /**
+   * Download everything in the account as one JSON document, as raw bytes.
+   *
+   * ```ts
+   * await writeFile("export.json", Buffer.from(await client.tenant.export()));
+   * ```
+   *
+   * The GDPR Article 20 portability route, and the way to take a backup.
+   * It is `application/json` streamed inline, with no redirect, and each
+   * record has the same shape its `GET` route returns, with
+   * `billkit_export_version` naming the shape. It can be large, so write
+   * it to a file rather than holding it in memory. Test and live data
+   * export separately: you get whichever mode the key belongs to. The
+   * access is recorded in your audit log.
+   */
+  export(): Promise<ArrayBuffer> {
+    return this.t.requestBinary({ method: "GET", path: "/v1/tenant/export" });
   }
 
   /** Current portal branding row (business name, theme, capability flags). */
@@ -1305,7 +1525,7 @@ export class Coupons extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/coupons/${id}`);
+    return this.get<T>(`/v1/coupons/${p(id)}`);
   }
 
   /**
@@ -1317,7 +1537,7 @@ export class Coupons extends BaseResource {
    * customer was charged. `active: true` brings the campaign back.
    */
   update<T = unknown>(id: string, params: UpdateCouponParams): Promise<T> {
-    return this.post<T, UpdateCouponParams>(`/v1/coupons/${id}`, params);
+    return this.post<T, UpdateCouponParams>(`/v1/coupons/${p(id)}`, params);
   }
 
   /**
@@ -1341,7 +1561,7 @@ export class Coupons extends BaseResource {
   }
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/coupons", p), { pageSize: options.pageSize });
+    return paginate<T>((page) => this.get("/v1/coupons", page), { pageSize: options.pageSize });
   }
 }
 
@@ -1351,7 +1571,7 @@ export class TaxRates extends BaseResource {
   }
 
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/tax_rates/${id}`);
+    return this.get<T>(`/v1/tax_rates/${p(id)}`);
   }
 
   /**
@@ -1363,7 +1583,7 @@ export class TaxRates extends BaseResource {
    * is no `delete()`.
    */
   update<T = unknown>(id: string, params: UpdateTaxRateParams): Promise<T> {
-    return this.post<T, UpdateTaxRateParams>(`/v1/tax_rates/${id}`, params);
+    return this.post<T, UpdateTaxRateParams>(`/v1/tax_rates/${p(id)}`, params);
   }
 
   list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1371,7 +1591,7 @@ export class TaxRates extends BaseResource {
   }
 
   iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/tax_rates", p), { pageSize: options.pageSize });
+    return paginate<T>((page) => this.get("/v1/tax_rates", page), { pageSize: options.pageSize });
   }
 }
 
@@ -1383,8 +1603,9 @@ export class TaxRates extends BaseResource {
  * {@link Invoices.retrievePdf}.
  */
 export class Invoices extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/invoices/${id}`);
+  /** Expandable: `customer`. */
+  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
+    return this.get<T>(`/v1/invoices/${p(id)}`, options);
   }
 
   /**
@@ -1406,15 +1627,38 @@ export class Invoices extends BaseResource {
    * structured invoice for tenants who render their own.
    */
   retrievePdf(id: string): Promise<ArrayBuffer> {
-    return this.t.requestBinary({ method: "GET", path: `/v1/invoices/${id}/pdf` });
+    return this.t.requestBinary({ method: "GET", path: `/v1/invoices/${p(id)}/pdf` });
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  /**
+   * Send the customer their invoice again.
+   *
+   * The same tenant-branded "your invoice is ready" email, with a fresh
+   * portal link, because the one in the original may have expired. It
+   * goes to the address captured **on the invoice**, not the customer's
+   * current one: this is a copy of a document that was issued to
+   * somebody. An invoice with no address on file is a
+   * `InvalidRequestError` rather than a send that did not happen.
+   */
+  sendEmail<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
+    return this.postEmpty<T>(`/v1/invoices/${p(id)}/email`, params);
+  }
+
+  list<T = unknown>(params: InvoicesListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/invoices", params);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/invoices", p), { pageSize: options.pageSize });
+  iter<T = unknown>(
+    options: {
+      pageSize?: number;
+      customer_id?: string;
+      subscription_id?: string;
+      payment_id?: string;
+      status?: string;
+    } = {},
+  ): AsyncIterableIterator<T> {
+    const { pageSize, ...filters } = options;
+    return paginate<T>((page) => this.get("/v1/invoices", page), { pageSize, filters });
   }
 
   /**
@@ -1433,7 +1677,7 @@ export class Invoices extends BaseResource {
    * Idempotent: re-voiding an already-void invoice returns it unchanged.
    */
   void<T = unknown>(id: string, params: VoidInvoiceParams = {}): Promise<T> {
-    return this.post<T, VoidInvoiceParams>(`/v1/invoices/${id}/void`, params);
+    return this.post<T, VoidInvoiceParams>(`/v1/invoices/${p(id)}/void`, params);
   }
 }
 
@@ -1449,7 +1693,7 @@ export class Invoices extends BaseResource {
  */
 export class CreditNotes extends BaseResource {
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/credit_notes/${id}`);
+    return this.get<T>(`/v1/credit_notes/${p(id)}`);
   }
 
   /**
@@ -1458,7 +1702,7 @@ export class CreditNotes extends BaseResource {
    * `302`, and `501 rendering_pending` on a deployment with no renderer.
    */
   retrievePdf(id: string): Promise<ArrayBuffer> {
-    return this.t.requestBinary({ method: "GET", path: `/v1/credit_notes/${id}/pdf` });
+    return this.t.requestBinary({ method: "GET", path: `/v1/credit_notes/${p(id)}/pdf` });
   }
 
   list<T = unknown>(params: CreditNotesListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1468,7 +1712,7 @@ export class CreditNotes extends BaseResource {
   iter<T = unknown>(
     options: { pageSize?: number; invoice_id?: string; customer_id?: string } = {},
   ): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/credit_notes", p), {
+    return paginate<T>((page) => this.get("/v1/credit_notes", page), {
       pageSize: options.pageSize,
       filters: { invoice_id: options.invoice_id, customer_id: options.customer_id },
     });
@@ -1484,7 +1728,7 @@ export class CreditNotes extends BaseResource {
  */
 export class AuditLogs extends BaseResource {
   retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/audit_logs/${id}`);
+    return this.get<T>(`/v1/audit_logs/${p(id)}`);
   }
 
   list<T = unknown>(params: AuditLogsListParams = {}): Promise<ListResponseEnvelope<T>> {
@@ -1500,7 +1744,7 @@ export class AuditLogs extends BaseResource {
       actor_id?: string;
     } = {},
   ): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/audit_logs", p), {
+    return paginate<T>((page) => this.get("/v1/audit_logs", page), {
       pageSize: options.pageSize,
       filters: {
         action: options.action,
@@ -1520,16 +1764,36 @@ export class AuditLogs extends BaseResource {
  * refunds and disputes are separate flows.
  */
 export class Payments extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/payments/${id}`);
+  /** Expandable: `customer`, `subscription`. */
+  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
+    return this.get<T>(`/v1/payments/${p(id)}`, options);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+  /**
+   * Fetch the provider's own record of this charge, live.
+   *
+   * Reads Mollie at request time rather than a stored copy, so it carries
+   * what BillKit deliberately does not keep: the card BIN, the iDEAL
+   * bank, the provider's own status string. Reading live means it can
+   * fail: a provider outage or a charge old enough to have aged out
+   * answers `200` with `available: false` and a short reason, so render
+   * the rest of the page regardless.
+   */
+  retrieveProvider<T = unknown>(id: string): Promise<T> {
+    return this.get<T>(`/v1/payments/${p(id)}/provider`);
+  }
+
+  list<T = unknown>(params: PaymentsListParams = {}): Promise<ListResponseEnvelope<T>> {
     return this.get<ListResponseEnvelope<T>>("/v1/payments", params);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((p) => this.get("/v1/payments", p), { pageSize: options.pageSize });
+  iter<T = unknown>(
+    options: { pageSize?: number; customer_id?: string } = {},
+  ): AsyncIterableIterator<T> {
+    return paginate<T>((page) => this.get("/v1/payments", page), {
+      pageSize: options.pageSize,
+      filters: { customer_id: options.customer_id },
+    });
   }
 }
 
@@ -1543,18 +1807,56 @@ export class Payments extends BaseResource {
  */
 export class BillingPortalSessions extends BaseResource {
   create<T = unknown>(params: CreateBillingPortalSessionParams): Promise<T> {
-    return this.postFixed<T>(
-      "/v1/billing_portal/sessions",
-      {
-        subscription_id: params.subscription_id,
-        return_url: params.return_url,
-      },
-      { idempotencyKey: params.idempotencyKey },
-    );
+    return this.post<T, CreateBillingPortalSessionParams>("/v1/billing_portal/sessions", params);
   }
 
   /** Kill an in-the-wild portal session. Idempotent. */
   revoke<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/billing_portal/sessions/${id}/revoke`, params);
+    return this.postEmpty<T>(`/v1/billing_portal/sessions/${p(id)}/revoke`, params);
+  }
+}
+
+/**
+ * Issue, inspect and revoke API keys.
+ *
+ * A key is issued in the same mode as the key that created it, so a test
+ * key can only mint test keys, and it can never grant scopes it does not
+ * hold itself. The secret is returned **once**, on
+ * {@link ApiKeys.create}; every later read carries only the prefix.
+ */
+export class ApiKeys extends BaseResource {
+  /**
+   * Issue a new key. The response's `secret` is the only time the full
+   * key exists outside the caller's own storage, so record it now.
+   */
+  create<T = unknown>(params: CreateApiKeyParams = {}): Promise<T> {
+    return this.post<T, CreateApiKeyParams>("/v1/api_keys", params);
+  }
+
+  /**
+   * One key's metadata: prefix, label, scopes, `revoked_at`, and
+   * `last_used_at`, which is the field to read before revoking one.
+   */
+  retrieve<T = unknown>(id: string): Promise<T> {
+    return this.get<T>(`/v1/api_keys/${p(id)}`);
+  }
+
+  /**
+   * Revoke a key so it stops working. Immediate and irreversible; issue a
+   * new key instead. Revoking an already-revoked key returns it
+   * unchanged, so a retry is safe, and a key may revoke itself, which is
+   * what you want when the leaked key is the one you are calling with.
+   */
+  revoke<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
+    return this.postEmpty<T>(`/v1/api_keys/${p(id)}/revoke`, params);
+  }
+
+  /** List keys, newest first. Revoked ones are included; check `revoked_at`. */
+  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
+    return this.get<ListResponseEnvelope<T>>("/v1/api_keys", params);
+  }
+
+  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
+    return paginate<T>((page) => this.get("/v1/api_keys", page), { pageSize: options.pageSize });
   }
 }

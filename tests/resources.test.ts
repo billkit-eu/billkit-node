@@ -66,7 +66,7 @@ describe("Coupons", () => {
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cpn_1" } }]);
     await client(fetchImpl).coupons.create({
       code: "WELCOME10",
-      discount_type: "percentage",
+      discount_type: "percent",
       discount_value: 10,
       duration: "once",
     });
@@ -74,6 +74,9 @@ describe("Coupons", () => {
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.code).toBe("WELCOME10");
     expect(body.duration).toBe("once");
+    // The API's two literals (`schemas/coupon.py`). "percentage" was never
+    // one of them and 422d at the boundary.
+    expect(body.discount_type).toBe("percent");
   });
 
   it("validate posts to /v1/coupons/validate with no idempotency", async () => {
@@ -840,5 +843,233 @@ describe("Metered pricing: sub-cent rates, tiers, dedupe, summary", () => {
     // The point of the endpoint: EUR 0.15 of usage will not be charged
     // this cycle, and the caller can see that before promising an amount.
     expect(summary.will_charge).toBe(false);
+  });
+});
+
+describe("path ids are percent-encoded", () => {
+  it("keeps a hostile id on the route the method names", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "x" } }]);
+    // Unencoded, `?` would start a query string, `#` would truncate the
+    // path, and `/` would walk to a different route entirely.
+    await client(fetchImpl).customers.retrieve("cus_a/b?c#d");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/customers/cus_a%2Fb%3Fc%23d");
+  });
+
+  it("encodes every segment of a two-id path", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: {} }]);
+    await client(fetchImpl).webhookEndpoints.retrieveDelivery("we_1/x", "whd_2?y");
+    expect(calls[0]?.url).toBe(
+      "https://test.billkit.eu/v1/webhook_endpoints/we_1%2Fx/deliveries/whd_2%3Fy",
+    );
+  });
+});
+
+describe("expand", () => {
+  it("joins the relations with commas on a list", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).subscriptions.list({ expand: ["customer", "price"], limit: 2 });
+    expect(calls[0]?.url).toBe(
+      "https://test.billkit.eu/v1/subscriptions?expand=customer%2Cprice&limit=2",
+    );
+  });
+
+  it("is the second argument on a retrieve", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "pay_1" } }]);
+    await client(fetchImpl).payments.retrieve("pay_1", { expand: ["customer"] });
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/payments/pay_1?expand=customer");
+  });
+
+  it("sends nothing when omitted", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "in_1" } }]);
+    await client(fetchImpl).invoices.retrieve("in_1");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/invoices/in_1");
+  });
+});
+
+describe("list filters", () => {
+  it("payments.list forwards customer_id", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).payments.list({ customer_id: "cus_1" });
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/payments?customer_id=cus_1");
+  });
+
+  it("invoices.list forwards all four filters", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).invoices.list({
+      customer_id: "cus_1",
+      subscription_id: "sub_1",
+      payment_id: "pay_1",
+      status: "paid",
+    });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(url.searchParams.get("customer_id")).toBe("cus_1");
+    expect(url.searchParams.get("subscription_id")).toBe("sub_1");
+    expect(url.searchParams.get("payment_id")).toBe("pay_1");
+    expect(url.searchParams.get("status")).toBe("paid");
+  });
+
+  it("disputes.iter carries its filters onto every page", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [{ id: "dp_1" }], has_more: true } },
+      { status: 200, body: { object: "list", data: [{ id: "dp_2" }], has_more: false } },
+    ]);
+    const seen: string[] = [];
+    for await (const row of client(fetchImpl).disputes.iter<{ id: string }>({
+      status: "open",
+      payment_id: "pay_1",
+    })) {
+      seen.push(row.id);
+    }
+    expect(seen).toEqual(["dp_1", "dp_2"]);
+    for (const call of calls) {
+      const url = new URL(call.url);
+      expect(url.searchParams.get("status")).toBe("open");
+      expect(url.searchParams.get("payment_id")).toBe("pay_1");
+    }
+    expect(new URL(calls[1]?.url ?? "").searchParams.get("starting_after")).toBe("dp_1");
+  });
+});
+
+describe("routes added in 0.7.0", () => {
+  it("invoices.sendEmail POSTs to /email with an idempotency key", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { invoice_id: "in_1", recipient: "ada@example.com" } },
+    ]);
+    await client(fetchImpl).invoices.sendEmail("in_1");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/invoices/in_1/email");
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
+  });
+
+  it("payments.retrieveProvider GETs /provider", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { available: false } }]);
+    await client(fetchImpl).payments.retrieveProvider("pay_1");
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/payments/pay_1/provider");
+    expect(calls[0]?.method).toBe("GET");
+  });
+
+  it("tenant.billingProfile / setBillingProfile hit /v1/tenant/billing_profile", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { country_code: null, effective_country_code: "NL" } },
+      { status: 200, body: { country_code: "NL" } },
+    ]);
+    const c = client(fetchImpl);
+    await c.tenant.billingProfile();
+    await c.tenant.setBillingProfile({ country_code: "NL", vat_id: null, city: "Amsterdam" });
+    expect(calls[0]?.method).toBe("GET");
+    expect(calls[1]?.url).toBe("https://test.billkit.eu/v1/tenant/billing_profile");
+    const body = JSON.parse(calls[1]?.body ?? "{}");
+    // An explicit null clears; an omitted field is left alone.
+    expect(body).toEqual({ country_code: "NL", vat_id: null, city: "Amsterdam" });
+  });
+
+  it("tenant.export returns the raw bytes", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { billkit_export_version: 2 } },
+    ]);
+    const bytes = await client(fetchImpl).tenant.export();
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/tenant/export");
+    expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ billkit_export_version: 2 });
+  });
+
+  it("webhookEndpoints.listEventTypes GETs the catalogue", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { data: ["customer.created"], wildcard: "*" } },
+    ]);
+    await client(fetchImpl).webhookEndpoints.listEventTypes();
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/webhook_endpoints/event_types");
+  });
+
+  it("apiKeys covers create / retrieve / revoke / list", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "ak_1", secret: "bk_test_x" } },
+      { status: 200, body: { id: "ak_1" } },
+      { status: 200, body: { id: "ak_1", revoked_at: 1 } },
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    const c = client(fetchImpl);
+    await c.apiKeys.create({ label: "ci", scopes: ["customers.read"] });
+    await c.apiKeys.retrieve("ak_1");
+    await c.apiKeys.revoke("ak_1");
+    await c.apiKeys.list({ limit: 5 });
+    expect(calls.map((x) => `${x.method} ${new URL(x.url).pathname}`)).toEqual([
+      "POST /v1/api_keys",
+      "GET /v1/api_keys/ak_1",
+      "POST /v1/api_keys/ak_1/revoke",
+      "GET /v1/api_keys",
+    ]);
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({
+      label: "ci",
+      scopes: ["customers.read"],
+    });
+  });
+});
+
+describe("bodies that must not be pruned", () => {
+  it("setVatNumber sends an explicit null to clear the registration", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cus_1" } }]);
+    await client(fetchImpl).customers.setVatNumber("cus_1", { vat_number: null });
+    // `null` clears server-side; only `undefined` is pruned, so
+    // `country_code` is absent while `vat_number` is present and null.
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ vat_number: null });
+  });
+
+  it("prices.update sends every forward-looking field it was given", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await client(fetchImpl).prices.update("price_1", {
+      active: false,
+      tax_behavior: "exclusive",
+      payment_methods: ["creditcard", "ideal"],
+      refund_on_cancel: "prorated",
+      refund_window_initial_days: 14,
+      refund_window_renewal_days: 0,
+      metadata: { tier: "pro" },
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({
+      active: false,
+      tax_behavior: "exclusive",
+      payment_methods: ["creditcard", "ideal"],
+      refund_on_cancel: "prorated",
+      refund_window_initial_days: 14,
+      refund_window_renewal_days: 0,
+      metadata: { tier: "pro" },
+    });
+  });
+
+  it("checkoutSessions.create carries country", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cs_1" } }]);
+    await client(fetchImpl).checkoutSessions.create({
+      customer_id: "cus_1",
+      price_id: "price_1",
+      success_url: "https://ok.test",
+      cancel_url: "https://no.test",
+      country: "NL",
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}").country).toBe("NL");
+  });
+
+  it("billingPortalSessions.create only sends deliver_email when set", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "bps_1" } },
+      { status: 200, body: { id: "bps_2" } },
+    ]);
+    const c = client(fetchImpl);
+    await c.billingPortalSessions.create({
+      subscription_id: "sub_1",
+      return_url: "https://app.test",
+    });
+    await c.billingPortalSessions.create({
+      subscription_id: "sub_1",
+      return_url: "https://app.test",
+      deliver_email: true,
+    });
+    expect("deliver_email" in JSON.parse(calls[0]?.body ?? "{}")).toBe(false);
+    expect(JSON.parse(calls[1]?.body ?? "{}").deliver_email).toBe(true);
   });
 });

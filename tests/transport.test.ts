@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { BillKit } from "../src/client.js";
 import { APIConnectionError } from "../src/errors.js";
 import type { RetryPolicy } from "../src/retry.js";
+import { makeMockFetch } from "./helpers.js";
 
 const NO_RETRY: RetryPolicy = {
   maxAttempts: 1,
@@ -61,5 +62,54 @@ describe("transport timeout", () => {
     });
 
     await expect(client.customers.retrieve("cus_1")).rejects.toThrow(/timed out after 25ms/);
+  });
+});
+
+describe("APIConnectionError carries the original error as `cause`", () => {
+  it("keeps the fetch failure that actually happened", async () => {
+    // Node's fetch reports every transport failure as "fetch failed" and
+    // puts the real reason in its own cause, so dropping ours left the
+    // caller with nothing to diagnose.
+    const underlying = new TypeError("fetch failed");
+    const { fetchImpl } = makeMockFetch([{ status: 0, error: underlying }]);
+    const client = new BillKit({
+      apiKey: "bk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: NO_RETRY,
+      fetch: fetchImpl,
+    });
+
+    const err = await client.customers.retrieve("cus_1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect((err as Error).cause).toBe(underlying);
+  });
+
+  it("keeps it on the timeout path too, message unchanged", async () => {
+    const client = new BillKit({
+      apiKey: "bk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      timeoutMs: 25,
+      retryPolicy: NO_RETRY,
+      fetch: stallingBodyFetch(),
+    });
+
+    const err = await client.customers.retrieve("cus_1").catch((e: unknown) => e);
+    expect((err as Error).message).toMatch(/timed out after 25ms/);
+    expect((err as Error).cause).toBeDefined();
+  });
+
+  it("leaves `cause` unset on an error the API actually answered", async () => {
+    const { fetchImpl } = makeMockFetch([
+      { status: 404, body: { error: { type: "invalid_request_error", message: "nope" } } },
+    ]);
+    const client = new BillKit({
+      apiKey: "bk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: NO_RETRY,
+      fetch: fetchImpl,
+    });
+
+    const err = await client.customers.retrieve("cus_1").catch((e: unknown) => e);
+    expect("cause" in (err as object)).toBe(false);
   });
 });

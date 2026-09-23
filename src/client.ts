@@ -8,6 +8,7 @@
  */
 
 import {
+  ApiKeys,
   AuditLogs,
   BillingPortalSessions,
   CheckoutSessions,
@@ -45,6 +46,7 @@ function resolveApiKey(supplied: string | undefined): string {
 }
 
 export class BillKit {
+  readonly apiKeys: ApiKeys;
   readonly customers: Customers;
   readonly products: Products;
   readonly prices: Prices;
@@ -69,6 +71,7 @@ export class BillKit {
       ...options,
       apiKey: resolveApiKey(options.apiKey),
     });
+    this.apiKeys = new ApiKeys(transport);
     this.customers = new Customers(transport);
     this.products = new Products(transport);
     this.prices = new Prices(transport);

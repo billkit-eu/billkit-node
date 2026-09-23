@@ -422,8 +422,10 @@ import type {
 } from "@billkit-eu/sdk";
 
 const couponParams: CreateCouponParams = {
+  // "percent" reads discount_value as whole percent; "fixed_cents" reads
+  // it as minor units off the charge. Those are the only two values.
   code: "WELCOME10",
-  discount_type: "percentage",
+  discount_type: "percent",
   discount_value: 10,
   duration: "once",
 };
