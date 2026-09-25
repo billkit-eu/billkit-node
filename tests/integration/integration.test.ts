@@ -226,6 +226,61 @@ d("BillKit node SDK against a live API", () => {
     });
 
     scenario(
+      "crud.product_default_price",
+      "a product's default price moves, clears with null, and is released on archive",
+      async () => {
+        type Product = {
+          default_price_id: string | null;
+          default_price: { id: string } | null;
+        };
+        const { product, price: first } = await makePlan(client, { amountCents: 1000 });
+        const second = await client.prices.create<{ id: string }>({
+          product_id: product.id,
+          amount_cents: 1200,
+          currency: "EUR",
+          interval: "month",
+        });
+
+        // The first price claims the default; a later one does not.
+        const initial = await client.products.retrieve<Product>(product.id);
+        expect(initial.default_price_id).toBe(first.id);
+
+        const moved = await client.products.update<Product>(product.id, {
+          default_price_id: second.id,
+        });
+        expect(moved.default_price_id).toBe(second.id);
+        const expanded = await client.products.retrieve<Product>(product.id, {
+          expand: ["default_price"],
+        });
+        expect(expanded.default_price?.id).toBe(second.id);
+
+        // Omitting the field leaves the default alone.
+        const renamed = await client.products.update<Product>(product.id, { name: "Renamed" });
+        expect(renamed.default_price_id).toBe(second.id);
+
+        // An explicit null is the clear, so it has to reach the wire.
+        const cleared = await client.products.update<Product>(product.id, {
+          default_price_id: null,
+        });
+        expect(cleared.default_price_id).toBeNull();
+
+        // Another product's price is refused on the field.
+        const other = await makePlan(client);
+        const err = await client.products
+          .update(product.id, { default_price_id: other.price.id })
+          .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(InvalidRequestError);
+        expect((err as InvalidRequestError).param).toBe("default_price_id");
+
+        // Archiving the default price releases it rather than being refused.
+        await client.products.update(product.id, { default_price_id: second.id });
+        await client.prices.update(second.id, { active: false });
+        const released = await client.products.retrieve<Product>(product.id);
+        expect(released.default_price_id).toBeNull();
+      },
+    );
+
+    scenario(
       "crud.price_update_fields",
       "a price takes every forward-looking field, without sending active",
       async () => {

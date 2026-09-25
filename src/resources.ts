@@ -170,7 +170,7 @@ export interface CustomerListParams extends BaseListParams {
 
 /** Query parameters accepted by `GET /v1/products`. */
 export interface ProductsListParams extends BaseListParams {
-  /** Expandable here: `prices`, `stats`. */
+  /** Expandable here: `prices`, `stats`, `default_price`. */
   expand?: string[];
 }
 
@@ -228,6 +228,14 @@ export interface UpdateProductParams extends IdempotencyOptions {
   active?: boolean;
   /** See {@link CreateProductParams.allow_promotion_codes}. */
   allow_promotion_codes?: boolean;
+  /**
+   * The price the billing portal offers on that price's interval. Must be
+   * an active price of this product; anything else is a 400 on
+   * `default_price_id`. An explicit `null` **clears** the default and is
+   * sent as a JSON null rather than pruned (only `undefined` is dropped);
+   * omit the field to leave the default alone.
+   */
+  default_price_id?: string | null;
 }
 
 /**
@@ -968,7 +976,10 @@ export class Products extends BaseResource {
     return this.post<T, CreateProductParams>("/v1/products", params);
   }
 
-  /** Expandable: `prices` (every price on the product), `stats`. */
+  /**
+   * Expandable: `prices` (every price on the product), `stats`, and
+   * `default_price` (the price `default_price_id` names).
+   */
   retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
     return this.get<T>(`/v1/products/${p(id)}`, options);
   }

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [0.7.1] - 2026-09-25
+
+### Added
+- `UpdateProductParams.default_price_id` (`string | null`) for the product's default price, the one the billing portal offers on that price's interval. It must be an active price of the same product. An explicit `null` clears it and is sent as a JSON null rather than pruned; omitting the field leaves the default alone.
+- `products.retrieve` and `products.list` document the `default_price` expansion alongside `prices` and `stats`.
+
+### Changed
+- `SetTenantBillingProfileParams` documents that the tenant `vat_id` is set once: changing it or clearing it with `null` afterwards is refused with a 400 `vat_id_locked` on `vat_id` and writes nothing, and support changes it. The address fields and `registration_number` still clear with `null`.
+
 ## [0.7.0] - 2026-09-23
 
 ### Fixed
@@ -255,7 +264,9 @@ First public release.
   back a one-shot paid with giropay before the shutdown works;
   `OneShotPayment.method` is a plain `string`.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/billkit-eu/billkit-node/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/billkit-eu/billkit-node/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/billkit-eu/billkit-node/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/billkit-eu/billkit-node/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/billkit-eu/billkit-node/compare/v0.3.0...v0.4.0

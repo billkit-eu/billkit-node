@@ -258,6 +258,37 @@ describe("Customers: VAT + GDPR purge", () => {
   });
 });
 
+describe("Products: default_price_id", () => {
+  it("sends a set value, an explicit null, and nothing when omitted", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "prod_1" } },
+      { status: 200, body: { id: "prod_1" } },
+      { status: 200, body: { id: "prod_1" } },
+    ]);
+    const c = client(fetchImpl);
+    await c.products.update("prod_1", { default_price_id: "price_2" });
+    await c.products.update("prod_1", { default_price_id: null });
+    await c.products.update("prod_1", { name: "Pro" });
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/products/prod_1");
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ default_price_id: "price_2" });
+    // null is the clear, so it must survive pruning; only undefined is dropped.
+    expect(JSON.parse(calls[1]?.body ?? "{}")).toEqual({ default_price_id: null });
+    expect(JSON.parse(calls[2]?.body ?? "{}")).toEqual({ name: "Pro" });
+  });
+
+  it("retrieve and list pass expand=default_price", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "prod_1", default_price: { id: "price_2" } } },
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    const c = client(fetchImpl);
+    await c.products.retrieve("prod_1", { expand: ["default_price"] });
+    await c.products.list({ expand: ["prices", "default_price"] });
+    expect(new URL(calls[0]?.url ?? "").searchParams.get("expand")).toBe("default_price");
+    expect(new URL(calls[1]?.url ?? "").searchParams.get("expand")).toBe("prices,default_price");
+  });
+});
+
 describe("CheckoutSessions: 0.2 body shape", () => {
   it("uses method / coupon_code / trial_days_override, not the old 0.1 names", async () => {
     // 0.1 sent payment_method / coupon / metadata which the API rejects.
