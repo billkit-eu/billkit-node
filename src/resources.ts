@@ -711,15 +711,20 @@ export interface CreditNotesListParams extends BaseListParams {
  * VAT is decided against and that an invoice prints.
  *
  * `country_code` is required on every call: there is nothing to leave
- * alone about a jurisdiction. Every other field is partial-update: omit
- * it to leave the stored value alone, or pass an explicit `null` to
- * clear it, because ceasing to be VAT registered (or moving office) is a
- * real event.
+ * alone about a jurisdiction. The address fields and
+ * `registration_number` are partial-update: omit one to leave the stored
+ * value alone, or pass an explicit `null` to clear it, because moving
+ * office is a real event.
+ *
+ * `vat_id` can be set once. After that, a different value or `null` is
+ * refused with a 400 (`param: "vat_id"`, reason `vat_id_locked`) and the
+ * call writes nothing; re-sending the stored number is accepted. BillKit
+ * invoices you reverse-charged against it, so support changes it.
  */
 export interface SetTenantBillingProfileParams extends IdempotencyOptions {
   /** ISO-3166-1 alpha-2, e.g. `"NL"`. */
   country_code: string;
-  /** Your own EU VAT registration, or `null` to clear it. */
+  /** Your own EU VAT registration. Set once; support changes or clears it. */
   vat_id?: string | null;
   address_line1?: string | null;
   address_line2?: string | null;

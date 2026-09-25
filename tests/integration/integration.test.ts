@@ -225,6 +225,74 @@ d("BillKit node SDK against a live API", () => {
       expect(back.amount_cents).toBe(777);
     });
 
+    scenario(
+      "crud.price_update_fields",
+      "a price takes every forward-looking field, without sending active",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 1500 });
+
+        // No `active` in the body. Every field is optional and an omitted
+        // one is left alone, so a refund policy can be set on a live price
+        // without restating whether it is on sale.
+        const updated = await client.prices.update<{
+          active: boolean;
+          metadata: Record<string, string>;
+          refund_on_cancel: string;
+          refund_window_renewal_days: number;
+        }>(price.id, {
+          metadata: { tier: "pro" },
+          refund_on_cancel: "prorated",
+          // 0 disables refunds for that charge type, so it has to survive
+          // the SDK's own null/undefined pruning.
+          refund_window_renewal_days: 0,
+        });
+        expect(updated.metadata).toEqual({ tier: "pro" });
+        expect(updated.refund_on_cancel).toBe("prorated");
+        expect(updated.refund_window_renewal_days).toBe(0);
+        expect(updated.active).toBe(true);
+
+        // The forward-looking change covers the price as it stands; it did
+        // not archive it as a side effect.
+        const fetched = await client.prices.retrieve<{ active: boolean; amount_cents: number }>(
+          price.id,
+        );
+        expect(fetched.active).toBe(true);
+        expect(fetched.amount_cents).toBe(1500);
+      },
+    );
+
+    scenario(
+      "crud.coupon_discount_type_literals",
+      "discount_type takes percent and fixed_cents, and nothing else",
+      async () => {
+        const percent = await client.coupons.create<{ discount_type: string }>({
+          code: `PCT${idemKey().slice(-10)}`,
+          discount_type: "percent",
+          discount_value: 10,
+          duration: "once",
+        });
+        expect(percent.discount_type).toBe("percent");
+
+        const fixed = await client.coupons.create<{ discount_type: string }>({
+          code: `FIX${idemKey().slice(-10)}`,
+          discount_type: "fixed_cents",
+          discount_value: 500,
+          duration: "once",
+        });
+        expect(fixed.discount_type).toBe("fixed_cents");
+
+        // The value these SDKs used to document. It is not a synonym.
+        await expect(
+          client.coupons.create({
+            code: `BAD${idemKey().slice(-10)}`,
+            discount_type: "percentage",
+            discount_value: 10,
+            duration: "once",
+          }),
+        ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
+
     scenario("crud.customer", "customer round-trips and delete removes it from the list", async () => {
       const email = `cust-${idemKey()}@sdk-it.example.com`;
       const created = await client.customers.create<{ id: string; email: string }>({
@@ -489,6 +557,40 @@ d("BillKit node SDK against a live API", () => {
     );
 
     scenario(
+      "filters.expand",
+      "expand attaches the relation on a list and on a retrieve",
+      async () => {
+        const { product, price } = await makePlan(client, { amountCents: 4200 });
+
+        // On a list. Resolved once for the whole page, which is the point:
+        // the alternative a caller reaches for is one request per row.
+        const page = await client.products.list<{
+          id: string;
+          prices?: Array<{ id: string }>;
+        }>({ expand: ["prices"], limit: 100 });
+        const row = page.data.find((p) => p.id === product.id);
+        expect(row, "the product is on the page").toBeDefined();
+        expect(row?.prices?.map((p) => p.id)).toContain(price.id);
+
+        // And on a retrieve, as a second argument.
+        const one = await client.products.retrieve<{ prices?: Array<{ id: string }> }>(product.id, {
+          expand: ["prices"],
+        });
+        expect(one.prices?.map((p) => p.id)).toContain(price.id);
+
+        // Without it, nothing changes for a caller that never asked.
+        const plain = await client.products.retrieve<{ prices?: unknown }>(product.id);
+        expect(plain.prices ?? null).toBeNull();
+
+        // An unknown relation is a 400 naming the ones that work, not a
+        // response that quietly lacks the key.
+        await expect(
+          client.products.retrieve(product.id, { expand: ["nonsense"] }),
+        ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
+
+    scenario(
       "filters.audit_resource_id",
       "resource_id narrows the audit log to one row's history",
       async () => {
@@ -525,6 +627,155 @@ d("BillKit node SDK against a live API", () => {
         });
         expect(narrowed.length).toBeGreaterThan(0);
         expect(narrowed.every((r) => r.resource_id === subject.id)).toBe(true);
+      },
+    );
+  });
+
+  // ── customers ─────────────────────────────────────────────────────
+
+  describe("customers", () => {
+    scenario(
+      "customers.vat_number_clear",
+      "an explicit null clears the VAT registration",
+      async () => {
+        // No country on the customer: VIES needs one, so the API stores
+        // the number as unverifiable without opening a socket. That keeps
+        // the scenario about the SDK's body rather than about the EU's
+        // uptime.
+        const customer = await client.customers.create<{ id: string }>({
+          email: `vat-${idemKey()}@sdk-it.example.com`,
+        });
+
+        const set = await client.customers.setVatNumber<{ vat_number: string | null }>(customer.id, {
+          vat_number: "NL123456789B01",
+        });
+        expect(set.vat_number).toBe("NL123456789B01");
+
+        // The one body where null is a value. Pruned, it would be an empty
+        // object, which the API reads as "change nothing".
+        const cleared = await client.customers.setVatNumber<{ vat_number: string | null }>(
+          customer.id,
+          { vat_number: null },
+        );
+        expect(cleared.vat_number).toBeNull();
+
+        const fetched = await client.customers.retrieve<{ vat_number: string | null }>(customer.id);
+        expect(fetched.vat_number).toBeNull();
+      },
+    );
+  });
+
+  // ── routes ────────────────────────────────────────────────────────
+
+  describe("routes", () => {
+    scenario("routes.api_keys", "an API key can be minted, read, listed and revoked", async () => {
+      const t = await provisionTenant("api-keys");
+      const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+      const created = await c.apiKeys.create<{ id: string; secret: string; scopes: string[] }>({
+        label: "integration",
+        scopes: ["products:read"],
+      });
+      expect(created.secret).toBeTruthy();
+      expect(created.scopes).toEqual(["products:read"]);
+
+      // The secret exists once. Every later read carries the prefix alone.
+      const fetched = await c.apiKeys.retrieve<{ id: string; secret?: string; prefix: string }>(
+        created.id,
+      );
+      expect(fetched.id).toBe(created.id);
+      expect(fetched.secret ?? null).toBeNull();
+      expect(fetched.prefix).toBeTruthy();
+
+      const listed = await c.apiKeys.list<{ id: string }>({ limit: 100 });
+      expect(listed.data.map((k) => k.id)).toContain(created.id);
+
+      const revoked = await c.apiKeys.revoke<{ id: string; revoked_at: number | null }>(created.id);
+      expect(revoked.revoked_at).toBeTruthy();
+
+      // A revoked key stays listed: "this key was in service until
+      // Tuesday" is the question a leak investigation asks.
+      const after = await c.apiKeys.list<{ id: string; revoked_at: number | null }>({ limit: 100 });
+      expect(after.data.find((k) => k.id === created.id)?.revoked_at).toBeTruthy();
+    });
+
+    scenario("routes.event_types", "the deliverable-event catalogue is readable", async () => {
+      const catalogue = await client.webhookEndpoints.listEventTypes<{
+        object: string;
+        data: string[];
+        wildcard: string;
+      }>();
+      expect(catalogue.object).toBe("event_type_list");
+      expect(catalogue.data.length).toBeGreaterThan(0);
+      expect(catalogue.wildcard).toBeTruthy();
+
+      // enabled_events is validated against exactly this list, so a name
+      // it returns has to register.
+      const endpoint = await client.webhookEndpoints.create<{ id: string }>({
+        url: "https://merchant.example.com/hooks",
+        enabled_events: [catalogue.data[0]!],
+      });
+      expect(endpoint.id).toBeTruthy();
+      await client.webhookEndpoints.delete(endpoint.id);
+    });
+
+    scenario(
+      "routes.tenant_billing_profile",
+      "the seller identity sets, reads back, and locks the VAT id once stored",
+      async () => {
+        const c = new BillKit({
+          apiKey: (await provisionTenant("billing-profile")).apiKey,
+          baseUrl: BASE_URL,
+        });
+        type Profile = {
+          country_code: string | null;
+          effective_country_code: string;
+          vat_id: string | null;
+          city: string | null;
+        };
+
+        const set = await c.tenant.setBillingProfile<Profile>({
+          country_code: "NL",
+          vat_id: "NL123456789B01",
+          city: "Amsterdam",
+        });
+        expect(set.country_code).toBe("NL");
+        expect(set.vat_id).toBe("NL123456789B01");
+
+        const read = await c.tenant.billingProfile<Profile>();
+        expect(read.vat_id).toBe("NL123456789B01");
+        // Stored and effective agree once something is stored; they differ
+        // only when nothing ever was.
+        expect(read.effective_country_code).toBe("NL");
+
+        // A stored VAT id is locked: changing it and clearing it with an
+        // explicit null are both refused, and the refusal names the field.
+        for (const vatId of ["NL000099998B57", null]) {
+          const err = await c.tenant
+            .setBillingProfile({ country_code: "NL", vat_id: vatId, city: "Rotterdam" })
+            .catch((e: unknown) => e);
+          expect(err).toBeInstanceOf(InvalidRequestError);
+          const invalid = err as InvalidRequestError;
+          expect(invalid.param).toBe("vat_id");
+          expect(invalid.code).toBe("parameter_invalid");
+          expect(invalid.message).toContain("cannot be changed once it is set");
+          expect(
+            (invalid.rawBody as { error: { reason?: string } }).error.reason,
+          ).toBe("vat_id_locked");
+        }
+
+        // The refused call wrote nothing, including the city it carried.
+        const after = await c.tenant.billingProfile<Profile>();
+        expect(after.vat_id).toBe("NL123456789B01");
+        expect(after.city).toBe("Amsterdam");
+
+        // Everything else stays editable: omit vat_id and it is left alone.
+        const moved = await c.tenant.setBillingProfile<Profile>({
+          country_code: "NL",
+          city: "Utrecht",
+        });
+        expect(moved.city).toBe("Utrecht");
+        expect(moved.vat_id).toBe("NL123456789B01");
       },
     );
   });
