@@ -48,12 +48,18 @@ async function post(path: string, body: unknown, headers: Record<string, string>
  * The email is randomised per call precisely so each suite/worker gets its
  * own tenant. List assertions ("exactly the 3 products I created") are only
  * stable under that isolation.
+ *
+ * `mode: "live"` returns a live-mode key, which the tenant-level settings
+ * (billing profile, portal branding) require: live traffic reads them.
  */
-export async function provisionTenant(label = "node-sdk-it"): Promise<TestTenant> {
+export async function provisionTenant(
+  label = "node-sdk-it",
+  mode: "test" | "live" = "test",
+): Promise<TestTenant> {
   const email = `${label}-${randomUUID()}@sdk-it.example.com`;
   const res = await post("/v1/console/auth/_test/login", {
     email,
-    mode: "test",
+    mode,
     tenant_name: `Node SDK IT ${label}`,
   });
   if (res.status === 404) {

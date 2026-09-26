@@ -96,7 +96,7 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 | `client.products` | `create`, `retrieve`, `update` (archive with `active: false`), `list`, `iter` |
 | `client.prices` | `create`, `retrieve`, `update` (archive with `active: false`, restore with `active: true`), `list`, `iter` |
 | `client.checkoutSessions` | `create`, `retrieve` |
-| `client.oneShotPayments` | `create`, `retrieve` |
+| `client.oneShotPayments` | `create`, `retrieve`, `list`, `iter` (filter by `customer_id`, `status`) |
 | `client.subscriptions` | `retrieve`, `list`, `iter` (filter by `customer_id`, `status`, `renewal_state`), `cancel`, `pause`, `resume`, `reactivate`, `previewUpdate`, `update`, `reauthorizePaymentMethod`, `createUsageRecord`, `listUsageRecords`, `iterUsageRecords`, `retrieveUsageSummary` |
 | `client.refunds` | `create`, `retrieve`, `list`, `iter` |
 | `client.disputes` | `retrieve`, `list`, `iter` |
@@ -108,8 +108,12 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 | `client.invoices` | `retrieve`, `retrievePdf`, `list`, `iter`, `void` |
 | `client.creditNotes` | `retrieve`, `retrievePdf`, `list`, `iter` (filter by `invoice_id`, `customer_id`) |
 | `client.auditLogs` | `retrieve`, `list`, `iter` (filter by `action`, `resource_type`, `resource_id`, `actor_id`) |
-| `client.payments` | `retrieve`, `list`, `iter` |
+| `client.payments` | `retrieve` (`expand: ["refund_eligibility"]` says whether a refund would succeed now), `list`, `iter` |
 | `client.billingPortalSessions` | `create`, `revoke` |
+
+### Clearing an optional field
+
+On an update, an explicit `null` clears a field and omitting it leaves the stored value alone. Only `undefined` is pruned from a request body, so `null` reaches the API as a JSON null. This applies to `products.update` (`description`, `default_price_id`), `customers.update` (`name`), `webhookEndpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry) and `taxRates.update` (`display_name`).
 
 ### Retiring something, and deleting something
 

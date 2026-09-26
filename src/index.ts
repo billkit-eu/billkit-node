@@ -90,6 +90,7 @@ export type {
   IdempotencyOptions,
   InvoicesListParams,
   ListParams,
+  OneShotPaymentsListParams,
   PaymentsListParams,
   PriceTier,
   PricesListParams,

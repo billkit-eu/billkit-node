@@ -72,6 +72,21 @@ export interface PaymentsListParams extends BaseListParams {
 }
 
 /**
+ * `oneShotPayments.list` params. `payments.list` lists subscription
+ * payments only; one-off charges are listed here, newest first.
+ * Failed, expired and still-open charges are included, so check `status`
+ * before counting a row as revenue.
+ */
+export interface OneShotPaymentsListParams extends BaseListParams {
+  customer_id?: string;
+  /**
+   * One of `open`, `pending`, `authorized`, `paid`, `failed`, `expired`,
+   * `canceled`, `refunded`. Anything else is a `400` on `status`.
+   */
+  status?: string;
+}
+
+/**
  * `invoices.list` params. The three id filters each narrow to one row's
  * worth of invoices: `payment_id` answers "which invoice did this charge
  * produce".
@@ -152,7 +167,8 @@ export interface CreateCustomerParams extends IdempotencyOptions {
 
 export interface UpdateCustomerParams extends IdempotencyOptions {
   email?: string;
-  name?: string;
+  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  name?: string | null;
   country_code?: string;
   metadata?: Record<string, string>;
 }
@@ -221,7 +237,8 @@ export interface CreateProductParams extends IdempotencyOptions {
 
 export interface UpdateProductParams extends IdempotencyOptions {
   name?: string;
-  description?: string;
+  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  description?: string | null;
   marketing_features?: string[];
   metadata?: Record<string, string>;
   /** Set false to stop selling a product without deleting history. */
@@ -604,7 +621,8 @@ export interface CreateWebhookEndpointParams extends IdempotencyOptions {
 export interface UpdateWebhookEndpointParams extends IdempotencyOptions {
   url?: string;
   enabled_events?: string[];
-  description?: string;
+  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  description?: string | null;
   status?: string;
 }
 
@@ -651,8 +669,10 @@ export interface CreateCouponParams extends IdempotencyOptions {
 
 export interface UpdateCouponParams extends IdempotencyOptions {
   active?: boolean;
-  max_redemptions?: number;
-  redeem_by?: number;
+  /** `null` removes the redemption cap. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  max_redemptions?: number | null;
+  /** Epoch seconds. `null` removes the expiry. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  redeem_by?: number | null;
   applies_to_price_ids?: string[];
   min_amount_cents?: number;
 }
@@ -682,7 +702,8 @@ export interface CreateTaxRateParams extends IdempotencyOptions {
 
 export interface UpdateTaxRateParams extends IdempotencyOptions {
   rate_basis_points?: number;
-  display_name?: string;
+  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  display_name?: string | null;
   inclusive?: boolean;
   active?: boolean;
 }
@@ -1095,6 +1116,20 @@ export class OneShotPayments extends BaseResource {
 
   retrieve<T = unknown>(id: string): Promise<T> {
     return this.get<T>(`/v1/checkout/one_shot/${p(id)}`);
+  }
+
+  /** List one-off charges, newest first. Filter by `customer_id` and `status`. */
+  list<T = unknown>(params: OneShotPaymentsListParams = {}): Promise<ListResponseEnvelope<T>> {
+    return this.get<ListResponseEnvelope<T>>("/v1/checkout/one_shot", params);
+  }
+
+  iter<T = unknown>(
+    options: { pageSize?: number; customer_id?: string; status?: string } = {},
+  ): AsyncIterableIterator<T> {
+    return paginate<T>((page) => this.get("/v1/checkout/one_shot", page), {
+      pageSize: options.pageSize,
+      filters: { customer_id: options.customer_id, status: options.status },
+    });
   }
 }
 
@@ -1780,7 +1815,20 @@ export class AuditLogs extends BaseResource {
  * refunds and disputes are separate flows.
  */
 export class Payments extends BaseResource {
-  /** Expandable: `customer`, `subscription`. */
+  /**
+   * Expandable: `customer`, `subscription`, `refund_eligibility`. The last
+   * is retrieve-only (`list` refuses it with a `400`) and attaches
+   * `refund_eligibility: { object: "refund_eligibility", eligible,
+   * amount_cents, currency, days_remaining, window_ends_at, reason }`:
+   * whether `refunds.create` for the remaining balance would succeed now,
+   * applying the refund window and the price's refund policy, which
+   * `amount_refundable_cents` does not. When `eligible` is false, `reason`
+   * is one of `not_paid`, `unrefundable_type`, `window_expired`,
+   * `fully_refunded`, `disputed`, `operation_pending` or
+   * `plan_change_pending` (a plan change is settling: the full balance
+   * cannot be refunded yet, a partial refund still can); treat any other
+   * value as "not refundable".
+   */
   retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
     return this.get<T>(`/v1/payments/${p(id)}`, options);
   }

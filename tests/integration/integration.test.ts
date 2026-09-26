@@ -528,6 +528,96 @@ d("BillKit node SDK against a live API", () => {
     });
 
     scenario(
+      "crud.nullable_fields_clear",
+      "an explicit null clears six optional fields and an omitted one is left alone",
+      async () => {
+        // Own tenant: the tax rate below must not collide with another
+        // scenario's active rate for the same country.
+        const t = await provisionTenant("nullable-clears");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+        const product = await c.products.create<{ id: string }>({
+          name: `Clear ${idemKey()}`,
+          description: "Long copy",
+        });
+        const productKept = await c.products.update<{ description: string | null }>(product.id, {
+          name: "Renamed",
+        });
+        expect(productKept.description).toBe("Long copy");
+        const productCleared = await c.products.update<{ description: string | null }>(
+          product.id,
+          { description: null },
+        );
+        expect(productCleared.description).toBeNull();
+
+        const customer = await c.customers.create<{ id: string }>({
+          email: `clear-${idemKey()}@sdk-it.example.com`,
+          name: "Ada",
+        });
+        const customerKept = await c.customers.update<{ name: string | null }>(customer.id, {
+          metadata: { k: "v" },
+        });
+        expect(customerKept.name).toBe("Ada");
+        const customerCleared = await c.customers.update<{ name: string | null }>(customer.id, {
+          name: null,
+        });
+        expect(customerCleared.name).toBeNull();
+
+        const endpoint = await c.webhookEndpoints.create<{ id: string }>({
+          url: "https://merchant.example.com/hooks/clear",
+          enabled_events: ["*"],
+          description: "to be cleared",
+        });
+        const endpointKept = await c.webhookEndpoints.update<{ description: string | null }>(
+          endpoint.id,
+          { enabled_events: ["*"] },
+        );
+        expect(endpointKept.description).toBe("to be cleared");
+        const endpointCleared = await c.webhookEndpoints.update<{ description: string | null }>(
+          endpoint.id,
+          { description: null },
+        );
+        expect(endpointCleared.description).toBeNull();
+
+        const redeemBy = Math.floor(Date.now() / 1000) + 30 * 86_400;
+        const coupon = await c.coupons.create<{ id: string }>({
+          code: `CLR${Date.now().toString().slice(-8)}`,
+          discount_type: "percent",
+          discount_value: 10,
+          duration: "once",
+          max_redemptions: 5,
+          redeem_by: redeemBy,
+        });
+        const couponKept = await c.coupons.update<{
+          max_redemptions: number | null;
+          redeem_by: number | null;
+        }>(coupon.id, { min_amount_cents: 100 });
+        expect(couponKept.max_redemptions).toBe(5);
+        expect(couponKept.redeem_by).toBe(redeemBy);
+        const couponCleared = await c.coupons.update<{
+          max_redemptions: number | null;
+          redeem_by: number | null;
+        }>(coupon.id, { max_redemptions: null, redeem_by: null });
+        expect(couponCleared.max_redemptions).toBeNull();
+        expect(couponCleared.redeem_by).toBeNull();
+
+        const rate = await c.taxRates.create<{ id: string }>({
+          country_code: "DE",
+          rate_basis_points: 1900,
+          display_name: "DE VAT",
+        });
+        const rateKept = await c.taxRates.update<{ display_name: string | null }>(rate.id, {
+          rate_basis_points: 1900,
+        });
+        expect(rateKept.display_name).toBe("DE VAT");
+        const rateCleared = await c.taxRates.update<{ display_name: string | null }>(rate.id, {
+          display_name: null,
+        });
+        expect(rateCleared.display_name).toBeNull();
+      },
+    );
+
+    scenario(
       "crud.credit_note_absent_until_refunded",
       "credit notes are issued, never created",
       async () => {
@@ -754,6 +844,50 @@ d("BillKit node SDK against a live API", () => {
       expect(after.data.find((k) => k.id === created.id)?.revoked_at).toBeTruthy();
     });
 
+    scenario(
+      "routes.one_shot_list",
+      "one-off charges list per customer, newest first, and filter by status",
+      async () => {
+        const t = await provisionTenant("one-shot-list");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const buyer = await c.customers.create<{ id: string }>({
+          email: `oneshot-${idemKey()}@sdk-it.example.com`,
+          country_code: "NL",
+        });
+        const charge = () =>
+          c.oneShotPayments.create<{ id: string; status: string }>({
+            customer_id: buyer.id,
+            amount_cents: 1500,
+            currency: "EUR",
+            method: "creditcard",
+            success_url: "https://merchant.example.com/ok",
+          });
+        const first = await charge();
+        const second = await charge();
+
+        const page = await c.oneShotPayments.list<{ id: string; status: string }>({
+          customer_id: buyer.id,
+        });
+        expect((page.data ?? []).map((r) => r.id)).toEqual([second.id, first.id]);
+
+        // A charge nobody has paid yet is still open at the provider.
+        const open = await c.oneShotPayments.list<{ id: string }>({
+          customer_id: buyer.id,
+          status: second.status,
+        });
+        expect((open.data ?? []).map((r) => r.id)).toContain(second.id);
+        const paid = await c.oneShotPayments.list<{ id: string }>({
+          customer_id: buyer.id,
+          status: second.status === "paid" ? "failed" : "paid",
+        });
+        expect(paid.data).toEqual([]);
+
+        await expect(
+          c.oneShotPayments.list({ customer_id: buyer.id, status: "settled" }),
+        ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
+
     scenario("routes.event_types", "the deliverable-event catalogue is readable", async () => {
       const catalogue = await client.webhookEndpoints.listEventTypes<{
         object: string;
@@ -778,8 +912,10 @@ d("BillKit node SDK against a live API", () => {
       "routes.tenant_billing_profile",
       "the seller identity sets, reads back, and locks the VAT id once stored",
       async () => {
+        // A live-mode key: the billing profile is shared by both modes, so a
+        // test-mode key may not write it.
         const c = new BillKit({
-          apiKey: (await provisionTenant("billing-profile")).apiKey,
+          apiKey: (await provisionTenant("billing-profile", "live")).apiKey,
           baseUrl: BASE_URL,
         });
         type Profile = {
@@ -1012,6 +1148,54 @@ d("BillKit node SDK against a live API", () => {
       expect(paid!.status).toBe("paid");
       expect(paid!.amount_cents).toBe(4200);
     });
+
+    scenario(
+      "money.payment_refund_eligibility",
+      "expand=refund_eligibility says what a refund would do now",
+      async () => {
+        const { price } = await makePlan(client, { amountCents: 10_000 });
+        await checkoutToActive(client, tenant, price.id);
+        const subs = await client.subscriptions.list<{ id: string; price_id: string }>({
+          limit: 100,
+        });
+        const sub = (subs.data ?? []).find((s) => s.price_id === price.id)!;
+        const payments = await client.payments.list<{ id: string; subscription_id: string | null }>(
+          { limit: 100 },
+        );
+        const payment = (payments.data ?? []).find((p) => p.subscription_id === sub.id)!;
+
+        type Eligibility = {
+          object: string;
+          eligible: boolean;
+          amount_cents: number;
+          window_ends_at: number | null;
+          reason: string | null;
+        };
+        const read = async () =>
+          (
+            await client.payments.retrieve<{ refund_eligibility: Eligibility }>(payment.id, {
+              expand: ["refund_eligibility"],
+            })
+          ).refund_eligibility;
+
+        const fresh = await read();
+        expect(fresh.object).toBe("refund_eligibility");
+        expect(fresh.eligible).toBe(true);
+        expect(fresh.amount_cents).toBe(10_000);
+        expect(typeof fresh.window_ends_at).toBe("number");
+        expect(fresh.reason).toBeNull();
+
+        await client.refunds.create({ payment_id: payment.id, amount_cents: 3000 });
+        const after = await read();
+        expect(after.eligible).toBe(true);
+        expect(after.amount_cents).toBe(7000);
+
+        // Retrieve-only: a list page would pay one query per row for it.
+        await expect(
+          client.payments.list({ expand: ["refund_eligibility"] }),
+        ).rejects.toBeInstanceOf(InvalidRequestError);
+      },
+    );
 
     scenario("money.partial_refund", "a partial refund leaves the remainder refundable", async () => {
       const { price } = await makePlan(client, { amountCents: 10_000 });
@@ -1393,7 +1577,13 @@ d("BillKit node SDK against a live API", () => {
      */
     const MANDATE_CREATING = ["creditcard", "ideal", "eps", "applepay", "paypal"] as const;
     /** Everything a single `sequenceType=oneoff` charge may use. */
-    const ONE_SHOT = [...RECURRING, "bancontact", "banktransfer"] as const;
+    // Not directdebit: SEPA only collects over a mandate another method
+    // minted, so the API refuses it on a one-off (asserted below).
+    const ONE_SHOT = [
+      ...RECURRING.filter((m) => m !== "directdebit"),
+      "bancontact",
+      "banktransfer",
+    ] as const;
 
     async function freshBuyer(c: BillKit) {
       return c.customers.create<{ id: string }>({
@@ -1463,7 +1653,7 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "methods.one_shot_vocabulary",
-      "a one-off charge takes every method, banktransfer included, and refuses giropay",
+      "a one-off charge takes every method, banktransfer included, and refuses directdebit and giropay",
       async () => {
         const t = await provisionTenant("methods-oneshot");
         const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
@@ -1480,19 +1670,23 @@ d("BillKit node SDK against a live API", () => {
           expect(charge.id, `${method} should take a one-off charge`).toBeTruthy();
         }
 
-        // giropay shut down at the end of 2024. Its refusal is part of the
-        // contract, which is why it is asserted rather than just omitted.
-        const buyer = await freshBuyer(c);
-        const err = await c.oneShotPayments
-          .create({
-            customer_id: buyer.id,
-            amount_cents: 2500,
-            currency: "EUR",
-            method: "giropay",
-            success_url: "https://merchant.example.com/ok",
-          })
-          .catch((e: unknown) => e);
-        expect(err).toBeInstanceOf(InvalidRequestError);
+        // directdebit only collects renewals over a mandate another method
+        // minted; giropay shut down at the end of 2024. Both refusals are
+        // part of the contract, which is why they are asserted rather than
+        // just omitted.
+        for (const method of ["directdebit", "giropay"]) {
+          const buyer = await freshBuyer(c);
+          const err = await c.oneShotPayments
+            .create({
+              customer_id: buyer.id,
+              amount_cents: 2500,
+              currency: "EUR",
+              method,
+              success_url: "https://merchant.example.com/ok",
+            })
+            .catch((e: unknown) => e);
+          expect(err, `${method} must not take a one-off charge`).toBeInstanceOf(InvalidRequestError);
+        }
       },
     );
 

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [Unreleased]
+
+## [0.8.0] - 2026-09-26
+
+### Added
+- `oneShotPayments.list(params)` and `oneShotPayments.iter(options)` for `GET /v1/checkout/one_shot`, newest first, filtered by `customer_id` and `status`. New exported type `OneShotPaymentsListParams`.
+- `payments.retrieve` documents the `refund_eligibility` expansion: `{ object, eligible, amount_cents, currency, days_remaining, window_ends_at, reason }`, whether a refund of the remaining balance would succeed now. It is retrieve-only; `payments.list` refuses it.
+
+### Changed
+- An explicit `null` now clears `UpdateProductParams.description`, `UpdateCustomerParams.name`, `UpdateWebhookEndpointParams.description`, `UpdateCouponParams.max_redemptions` and `redeem_by`, and `UpdateTaxRateParams.display_name`. The types accept `null`, and it is sent as a JSON null rather than pruned; omitting the field still leaves it alone.
+  **Upgrade note:** a `null` you pass through from your own data now clears the field. `customers.update(id, { name: user.name })` with `user.name` sometimes `null` used to leave the name alone and now erases it; pass `undefined` (or omit the key) when you mean "leave it".
+
 ## [0.7.1] - 2026-09-25
 
 ### Added
@@ -264,7 +276,8 @@ First public release.
   back a one-shot paid with giropay before the shutdown works;
   `OneShotPayment.method` is a plain `string`.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/billkit-eu/billkit-node/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/billkit-eu/billkit-node/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/billkit-eu/billkit-node/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/billkit-eu/billkit-node/compare/v0.5.0...v0.6.0

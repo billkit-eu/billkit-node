@@ -14,6 +14,13 @@ import { describe, expect, it } from "vitest";
 
 import { BillKit } from "../src/client.js";
 import { ServerError } from "../src/errors.js";
+import type {
+  UpdateCouponParams,
+  UpdateCustomerParams,
+  UpdateProductParams,
+  UpdateTaxRateParams,
+  UpdateWebhookEndpointParams,
+} from "../src/resources.js";
 import { FAST_RETRY, makeMockFetch } from "./helpers.js";
 
 function client(fetchImpl: typeof fetch) {
@@ -1102,5 +1109,122 @@ describe("bodies that must not be pruned", () => {
     });
     expect("deliver_email" in JSON.parse(calls[0]?.body ?? "{}")).toBe(false);
     expect(JSON.parse(calls[1]?.body ?? "{}").deliver_email).toBe(true);
+  });
+});
+
+describe("Nullable update fields: explicit null clears", () => {
+  const cases: Array<{
+    name: string;
+    path: string;
+    field: string;
+    value: unknown;
+    call: (c: BillKit, body: Record<string, unknown>) => Promise<unknown>;
+  }> = [
+    {
+      name: "products.update description",
+      path: "/v1/products/prod_1",
+      field: "description",
+      value: "Long copy",
+      call: (c, b) => c.products.update("prod_1", b as UpdateProductParams),
+    },
+    {
+      name: "customers.update name",
+      path: "/v1/customers/cus_1",
+      field: "name",
+      value: "Ada",
+      call: (c, b) => c.customers.update("cus_1", b as UpdateCustomerParams),
+    },
+    {
+      name: "webhookEndpoints.update description",
+      path: "/v1/webhook_endpoints/we_1",
+      field: "description",
+      value: "Prod hook",
+      call: (c, b) => c.webhookEndpoints.update("we_1", b as UpdateWebhookEndpointParams),
+    },
+    {
+      name: "coupons.update max_redemptions",
+      path: "/v1/coupons/cpn_1",
+      field: "max_redemptions",
+      value: 10,
+      call: (c, b) => c.coupons.update("cpn_1", b as UpdateCouponParams),
+    },
+    {
+      name: "coupons.update redeem_by",
+      path: "/v1/coupons/cpn_1",
+      field: "redeem_by",
+      value: 1_900_000_000,
+      call: (c, b) => c.coupons.update("cpn_1", b as UpdateCouponParams),
+    },
+    {
+      name: "taxRates.update display_name",
+      path: "/v1/tax_rates/txr_1",
+      field: "display_name",
+      value: "VAT",
+      call: (c, b) => c.taxRates.update("txr_1", b as UpdateTaxRateParams),
+    },
+  ];
+
+  for (const tc of cases) {
+    it(`${tc.name}: sends a value, an explicit null, and nothing when omitted`, async () => {
+      const { fetchImpl, calls } = makeMockFetch([
+        { status: 200, body: {} },
+        { status: 200, body: {} },
+        { status: 200, body: {} },
+      ]);
+      const c = client(fetchImpl);
+      await tc.call(c, { [tc.field]: tc.value });
+      await tc.call(c, { [tc.field]: null });
+      await tc.call(c, {});
+      expect(new URL(calls[0]?.url ?? "").pathname).toBe(tc.path);
+      expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ [tc.field]: tc.value });
+      // null is the clear, so it must survive pruning; only undefined is dropped.
+      expect(JSON.parse(calls[1]?.body ?? "{}")).toEqual({ [tc.field]: null });
+      expect(JSON.parse(calls[2]?.body ?? "{}")).not.toHaveProperty(tc.field);
+    });
+  }
+});
+
+describe("OneShotPayments: list and iter", () => {
+  it("list GETs /v1/checkout/one_shot with both filters", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [], has_more: false } },
+    ]);
+    await client(fetchImpl).oneShotPayments.list({ customer_id: "cus_1", status: "paid", limit: 5 });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(calls[0]?.method).toBe("GET");
+    expect(url.pathname).toBe("/v1/checkout/one_shot");
+    expect(url.searchParams.get("customer_id")).toBe("cus_1");
+    expect(url.searchParams.get("status")).toBe("paid");
+    expect(url.searchParams.get("limit")).toBe("5");
+  });
+
+  it("iter carries both filters onto every page", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { object: "list", data: [{ id: "osp_2" }], has_more: true } },
+      { status: 200, body: { object: "list", data: [{ id: "osp_1" }], has_more: false } },
+    ]);
+    const seen: string[] = [];
+    for await (const row of client(fetchImpl).oneShotPayments.iter<{ id: string }>({
+      customer_id: "cus_1",
+      status: "open",
+    })) {
+      seen.push(row.id);
+    }
+    expect(seen).toEqual(["osp_2", "osp_1"]);
+    const second = new URL(calls[1]?.url ?? "");
+    expect(second.pathname).toBe("/v1/checkout/one_shot");
+    expect(second.searchParams.get("customer_id")).toBe("cus_1");
+    expect(second.searchParams.get("status")).toBe("open");
+    expect(second.searchParams.get("starting_after")).toBe("osp_2");
+  });
+});
+
+describe("Payments: expand=refund_eligibility", () => {
+  it("retrieve forwards the relation", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "pay_1", refund_eligibility: { eligible: true } } },
+    ]);
+    await client(fetchImpl).payments.retrieve("pay_1", { expand: ["refund_eligibility"] });
+    expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/payments/pay_1?expand=refund_eligibility");
   });
 });
