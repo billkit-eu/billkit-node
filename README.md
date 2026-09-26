@@ -113,7 +113,7 @@ The client exposes one accessor per resource family. Each mirrors the verbs from
 
 ### Clearing an optional field
 
-On an update, an explicit `null` clears a field and omitting it leaves the stored value alone. Only `undefined` is pruned from a request body, so `null` reaches the API as a JSON null. This applies to `products.update` (`description`, `default_price_id`), `customers.update` (`name`), `webhookEndpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry) and `taxRates.update` (`display_name`).
+On an update, an explicit `null` clears a field and omitting it leaves the stored value alone. Only `undefined` is pruned from a request body, so `null` reaches the API as a JSON null. This applies to `products.update` (`description`, `default_price_id`, `marketing_features` empties the list), `prices.update` (`refund_window_initial_days` and `refund_window_renewal_days` drop the price's override), `customers.update` (`name`), `webhookEndpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry, `applies_to_price_ids` lifts the price restriction, `min_amount_cents` lifts the minimum) and `taxRates.update` (`display_name`). Every other update field is typed without `null`, and the API refuses a null there with a 400 naming the field. A `metadata` update replaces the stored object whole, so `metadata: {}` is how it is emptied.
 
 ### Retiring something, and deleting something
 

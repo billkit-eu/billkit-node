@@ -239,7 +239,9 @@ export interface UpdateProductParams extends IdempotencyOptions {
   name?: string;
   /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
   description?: string | null;
-  marketing_features?: string[];
+  /** `null` empties the list. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  marketing_features?: string[] | null;
+  /** Replaces the stored object whole; send `{}` to empty it. */
   metadata?: Record<string, string>;
   /** Set false to stop selling a product without deleting history. */
   active?: boolean;
@@ -271,6 +273,9 @@ export interface UpdateProductParams extends IdempotencyOptions {
  * the price is still `"unspecified"` and never changed again, because
  * flipping it would restate whether tax was inside or on top of an amount
  * somebody has already paid.
+ *
+ * Only the two refund windows accept `null`, which clears the price's
+ * override. The API refuses a `null` on any other field here with a 400.
  */
 export interface UpdatePriceParams extends IdempotencyOptions {
   /** `false` withdraws the price from sale, `true` puts it back. */
@@ -283,9 +288,13 @@ export interface UpdatePriceParams extends IdempotencyOptions {
     "creditcard" | "directdebit" | "ideal" | "eps" | "applepay" | "paypal" | (string & {})
   >;
   refund_on_cancel?: "none" | "full" | "prorated";
-  /** `0` disables refunds for that charge type; `N > 0` is an N-day window. */
-  refund_window_initial_days?: number;
-  refund_window_renewal_days?: number;
+  /**
+   * `0` disables refunds for that charge type; `N > 0` is an N-day window.
+   * `null` drops the price's override. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone.
+   */
+  refund_window_initial_days?: number | null;
+  /** As {@link UpdatePriceParams.refund_window_initial_days}, for renewals. */
+  refund_window_renewal_days?: number | null;
 }
 
 /**
@@ -673,8 +682,10 @@ export interface UpdateCouponParams extends IdempotencyOptions {
   max_redemptions?: number | null;
   /** Epoch seconds. `null` removes the expiry. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
   redeem_by?: number | null;
-  applies_to_price_ids?: string[];
-  min_amount_cents?: number;
+  /** `null` lifts the price restriction. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  applies_to_price_ids?: string[] | null;
+  /** `null` lifts the minimum. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
+  min_amount_cents?: number | null;
 }
 
 export interface ValidateCouponParams {

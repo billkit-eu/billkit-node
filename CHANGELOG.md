@@ -10,6 +10,14 @@ so the numbers will diverge after this first release.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Changed
+- `UpdateCouponParams.applies_to_price_ids` (`null` lifts the price restriction), `UpdateCouponParams.min_amount_cents` (`null` lifts the minimum), `UpdateProductParams.marketing_features` (`null` empties the list) and `UpdatePriceParams.refund_window_initial_days` / `refund_window_renewal_days` (`null` drops the price's override) now accept `null`, sent as a JSON null. The request already carried a `null` through; the types refused it. Every other update field stays typed without `null`.
+  **Upgrade note:** as in 0.8.0, a null passed through from your own data clears the field: `coupons.update(id, { min_amount_cents: row.min })` with `row.min` sometimes `null` now lifts the coupon's minimum, which widens who can redeem it. Omit the field when you mean "leave it".
+  **Requires the matching API release.** An older API accepts the null on `applies_to_price_ids`, `min_amount_cents` and `marketing_features` and leaves the value in place.
+- Every other update field refuses an explicit null with a `400` naming the field (the API used to ignore it). The SDK never sends one there; omit the field to leave it unchanged.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added
@@ -276,7 +284,8 @@ First public release.
   back a one-shot paid with giropay before the shutdown works;
   `OneShotPayment.method` is a plain `string`.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-node/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/billkit-eu/billkit-node/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/billkit-eu/billkit-node/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/billkit-eu/billkit-node/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/billkit-eu/billkit-node/compare/v0.6.0...v0.7.0

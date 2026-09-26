@@ -529,7 +529,7 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "crud.nullable_fields_clear",
-      "an explicit null clears six optional fields and an omitted one is left alone",
+      "an explicit null clears seven optional fields and an omitted one is left alone",
       async () => {
         // Own tenant: the tax rate below must not collide with another
         // scenario's active rate for the same country.
@@ -591,15 +591,19 @@ d("BillKit node SDK against a live API", () => {
         const couponKept = await c.coupons.update<{
           max_redemptions: number | null;
           redeem_by: number | null;
+          min_amount_cents: number | null;
         }>(coupon.id, { min_amount_cents: 100 });
         expect(couponKept.max_redemptions).toBe(5);
         expect(couponKept.redeem_by).toBe(redeemBy);
+        expect(couponKept.min_amount_cents).toBe(100);
         const couponCleared = await c.coupons.update<{
           max_redemptions: number | null;
           redeem_by: number | null;
-        }>(coupon.id, { max_redemptions: null, redeem_by: null });
+          min_amount_cents: number | null;
+        }>(coupon.id, { max_redemptions: null, redeem_by: null, min_amount_cents: null });
         expect(couponCleared.max_redemptions).toBeNull();
         expect(couponCleared.redeem_by).toBeNull();
+        expect(couponCleared.min_amount_cents).toBeNull();
 
         const rate = await c.taxRates.create<{ id: string }>({
           country_code: "DE",
