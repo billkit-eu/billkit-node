@@ -86,6 +86,21 @@ await client.refunds.create({ one_shot_payment_id: payment.id });
 await client.refunds.create({ one_shot_payment_id: payment.id, amount_cents: 500 });
 ```
 
+To take the payment inside your own page instead of redirecting to Mollie, create it with `ui_mode: "embedded"` and no `method`, then hand the `client_secret` (and nothing else) to the browser, where `mountOneShotPaymentElement` from `@billkit-eu/js` (or `<OneShotPaymentElement/>` from `@billkit-eu/react`) lets the payer pick a method and pay:
+
+```ts
+const embedded = await client.oneShotPayments.create<{ client_secret: string }>({
+  customer_id: customer.id,
+  amount_cents: 2500,
+  currency: "EUR",
+  ui_mode: "embedded",
+  success_url: "https://shop.example.com/thanks",
+});
+// embedded.client_secret: short-lived, on the create response only.
+```
+
+`redirect_url` is `null` and `method` stays `null` until the payer confirms. Fulfil from the same `one_shot_payment.succeeded` webhook as a hosted one-shot.
+
 ## Resources
 
 The client exposes one accessor per resource family. Each mirrors the verbs from `/v1/<resource>` 1:1:

@@ -849,6 +849,41 @@ d("BillKit node SDK against a live API", () => {
     });
 
     scenario(
+      "routes.one_shot_embedded",
+      "an embedded one-shot returns a client_secret once, with no method or redirect",
+      async () => {
+        const t = await provisionTenant("one-shot-embedded");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+        const buyer = await c.customers.create<{ id: string }>({
+          email: `oneshot-emb-${idemKey()}@sdk-it.example.com`,
+          country_code: "NL",
+        });
+        type OneShot = {
+          id: string;
+          ui_mode: string;
+          method: string | null;
+          redirect_url: string | null;
+          client_secret: string | null;
+        };
+        const created = await c.oneShotPayments.create<OneShot>({
+          customer_id: buyer.id,
+          amount_cents: 1500,
+          currency: "EUR",
+          ui_mode: "embedded",
+          success_url: "https://merchant.example.com/ok",
+        });
+        expect(created.ui_mode).toBe("embedded");
+        expect(created.redirect_url).toBeNull();
+        expect(created.method).toBeNull();
+        expect(created.client_secret?.startsWith(`${created.id}_secret_`)).toBe(true);
+
+        const read = await c.oneShotPayments.retrieve<OneShot>(created.id);
+        expect(read.client_secret).toBeNull();
+        expect(read.ui_mode).toBe("embedded");
+      },
+    );
+
+    scenario(
       "routes.one_shot_list",
       "one-off charges list per customer, newest first, and filter by status",
       async () => {

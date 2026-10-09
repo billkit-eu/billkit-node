@@ -568,8 +568,22 @@ export interface CreateOneShotPaymentParams extends IdempotencyOptions {
   /** ISO-4217, e.g. `"EUR"`. Validated against the tenant allowlist. */
   currency: string;
   /**
-   * Concrete Mollie method to charge with. Required, because a one-shot commits
-   * up front). Validated against the tenant's capability allowlist for
+   * How the payer pays. `"hosted"` (the server default when omitted) needs
+   * `method` and answers with a `redirect_url` on Mollie's hosted page.
+   * `"embedded"` must be sent WITHOUT `method`: no provider payment is
+   * created yet, and the response carries a short-lived `client_secret`
+   * (with a null `redirect_url`) for the browser payment element
+   * (`mountOneShotPaymentElement` in `@billkit-eu/js`), where the payer picks
+   * the method. `method` stays null until they confirm, and `expires_at` is
+   * when the secret and the unconfirmed charge lapse. The secret is on the
+   * create response only; a retrieve reads it back as null. Events, refunds
+   * and the payment id are the same in both modes.
+   */
+  ui_mode?: "hosted" | "embedded";
+  /**
+   * Concrete Mollie method to charge with. Required for a hosted one-shot,
+   * which commits to a method up front, and must be omitted for an embedded
+   * one (the server answers 422 either way round). Validated against the tenant's capability allowlist for
    * `currency`; one-off methods like `bancontact` and `banktransfer` are
    * allowed here even though they can't back a subscription.
    *
@@ -583,7 +597,7 @@ export interface CreateOneShotPaymentParams extends IdempotencyOptions {
    * *request* type the server validates, so an SDK that lags a newly-added
    * method should not be the thing that blocks the call.
    */
-  method:
+  method?:
     | "creditcard"
     | "directdebit"
     | "ideal"
@@ -1120,7 +1134,11 @@ export class CheckoutSessions extends BaseResource {
  * with `client.refunds.create({ one_shot_payment_id })`.
  */
 export class OneShotPayments extends BaseResource {
-  /** Create a one-off charge; returns the object with a `redirect_url`. */
+  /**
+   * Create a one-off charge. Hosted (the default) returns the object with a
+   * `redirect_url`; `ui_mode: "embedded"` returns it with a `client_secret`
+   * for the browser payment element instead.
+   */
   create<T = unknown>(params: CreateOneShotPaymentParams): Promise<T> {
     return this.post<T, CreateOneShotPaymentParams>("/v1/checkout/one_shot", params);
   }

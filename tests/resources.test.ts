@@ -381,8 +381,37 @@ describe("OneShotPayments", () => {
     expect(body.method).toBe("ideal");
     // `0` must survive dropUndefined; it disables refunds for this payment.
     expect(body.refund_window_days).toBe(0);
+    // Hosted is the server default, so an omitted ui_mode is never sent.
+    expect("ui_mode" in body).toBe(false);
     // Auto-idempotency wraps the mutating call.
     expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
+  });
+
+  it("create in embedded mode sends ui_mode, no method, and returns the client_secret", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      {
+        status: 200,
+        body: {
+          id: "osp_1",
+          object: "one_shot_payment",
+          ui_mode: "embedded",
+          method: null,
+          redirect_url: null,
+          client_secret: "osp_1_secret_abc",
+        },
+      },
+    ]);
+    const created = await client(fetchImpl).oneShotPayments.create<{ client_secret: string }>({
+      customer_id: "cus_1",
+      amount_cents: 2500,
+      currency: "EUR",
+      ui_mode: "embedded",
+      success_url: "https://shop.example.com/thanks",
+    });
+    expect(created.client_secret).toBe("osp_1_secret_abc");
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body.ui_mode).toBe("embedded");
+    expect("method" in body).toBe(false);
   });
 
   it("retrieve fetches /v1/checkout/one_shot/{id}", async () => {

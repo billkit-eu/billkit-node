@@ -1,6 +1,6 @@
 {
   "name": "@billkit-eu/sdk",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Official Node.js SDK for BillKit: a Stripe-Billing-shape multi-tenant SaaS API on Mollie.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -54,14 +54,14 @@
     "provenance": true
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
-    "@typescript-eslint/eslint-plugin": "^8.67.0",
-    "@typescript-eslint/parser": "^8.20.0",
-    "eslint": "^10.8.1",
+    "@types/node": "^26.6.2",
+    "@typescript-eslint/eslint-plugin": "^8.70.1",
+    "@typescript-eslint/parser": "^8.70.1",
+    "eslint": "^10.11.0",
     "msw": "^2.15.0",
     "tsup": "^8.3.5",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.1"
   },
   "sideEffects": false
 }

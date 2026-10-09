@@ -10,6 +10,14 @@ so the numbers will diverge after this first release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-09
+
+### Added
+- Embedded one-off payments: `CreateOneShotPaymentParams.ui_mode` (`"hosted"` | `"embedded"`). Sent as `"embedded"` without `method`, `oneShotPayments.create` creates no provider payment yet and returns a short-lived `client_secret` (with a null `redirect_url`) for the browser payment element in `@billkit-eu/js` / `@billkit-eu/react`, where the payer picks the method. Events, refunds and the payment id work as for a hosted one-shot. **Requires the matching API release.**
+
+### Changed
+- `CreateOneShotPaymentParams.method` is now optional in the type, because an embedded one-shot must omit it. A hosted one-shot still needs it and the API refuses the call without it.
+
 ## [0.8.1] - 2026-09-26
 
 ### Changed
