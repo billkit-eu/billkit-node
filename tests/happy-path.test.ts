@@ -167,7 +167,7 @@ describe("happy path", () => {
       fetch: fetchImpl,
     });
 
-    await client.customers.create({ email: "a@b.co", idempotencyKey: "my-key" });
+    await client.customers.create({ email: "a@b.co" }, { idempotencyKey: "my-key" });
     expect(calls[0]?.headers["idempotency-key"]).toBe("my-key");
   });
 });

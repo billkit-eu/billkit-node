@@ -28,6 +28,38 @@ describe("retry", () => {
     expect(calls).toHaveLength(3);
   });
 
+  it.each([500, 502, 503, 504, 507, 599])("retries a %i", async (status) => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status, body: { error: { type: "api_error", message: "x" } } },
+      { status: 200, body: { id: "cus_1" } },
+    ]);
+    const client = new BillKit({
+      apiKey: "bk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: FAST_RETRY,
+      fetch: fetchImpl,
+    });
+
+    await expect(client.customers.retrieve("cus_1")).resolves.toMatchObject({ id: "cus_1" });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("never retries a 501: the route is not implemented, and asking again changes nothing", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 501, body: { error: { type: "api_error", message: "not implemented" } } },
+      { status: 200, body: { id: "cus_1" } },
+    ]);
+    const client = new BillKit({
+      apiKey: "bk_test_unit",
+      baseUrl: "https://test.billkit.eu",
+      retryPolicy: FAST_RETRY,
+      fetch: fetchImpl,
+    });
+
+    await expect(client.customers.retrieve("cus_1")).rejects.toBeInstanceOf(ServerError);
+    expect(calls).toHaveLength(1);
+  });
+
   it("exhausts retry budget then raises", async () => {
     const { fetchImpl, calls } = makeMockFetch([
       { status: 500, body: { error: { type: "api_error", message: "boom" } } },

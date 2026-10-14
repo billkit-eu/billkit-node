@@ -1,6 +1,6 @@
 {
   "name": "@billkit-eu/sdk",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Official Node.js SDK for BillKit: a Stripe-Billing-shape multi-tenant SaaS API on Mollie.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -8,28 +8,38 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "src",
     "README.md",
     "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.typetests.json",
     "lint": "eslint src tests",
-    "prepublishOnly": "npm run build && npm run test && npm run typecheck"
+    "generate": "node scripts/generate-types.mjs",
+    "generate:check": "node scripts/generate-types.mjs --check",
+    "check:package": "npm run build && publint --strict && attw --pack . && node scripts/check-exports.mjs",
+    "prepublishOnly": "npm run generate:check && npm run build && npm run test && npm run typecheck && publint --strict && npm_config_dry_run=false attw --pack . && node scripts/check-exports.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "keywords": [
     "billkit",
@@ -54,11 +64,13 @@
     "provenance": true
   },
   "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
     "@types/node": "^26.6.2",
     "@typescript-eslint/eslint-plugin": "^8.70.1",
     "@typescript-eslint/parser": "^8.70.1",
     "eslint": "^10.11.0",
     "msw": "^2.15.0",
+    "publint": "^0.3.25",
     "tsup": "^8.3.5",
     "typescript": "^6.0.3",
     "vitest": "^5.0.1"

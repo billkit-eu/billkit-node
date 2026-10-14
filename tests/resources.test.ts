@@ -13,7 +13,7 @@
 import { describe, expect, it } from "vitest";
 
 import { BillKit } from "../src/client.js";
-import { ServerError } from "../src/errors.js";
+import { PermissionDeniedError, ServerError } from "../src/errors.js";
 import type {
   UpdateCouponParams,
   UpdateCustomerParams,
@@ -21,7 +21,7 @@ import type {
   UpdateProductParams,
   UpdateTaxRateParams,
   UpdateWebhookEndpointParams,
-} from "../src/resources.js";
+} from "../src/params.js";
 import { FAST_RETRY, makeMockFetch } from "./helpers.js";
 
 function client(fetchImpl: typeof fetch) {
@@ -38,7 +38,7 @@ describe("Tenant", () => {
     const { fetchImpl, calls } = makeMockFetch([
       { status: 200, body: { profile_id: "pfl_x", payment_methods: ["creditcard"] } },
     ]);
-    await client(fetchImpl).tenant.capabilities();
+    await client(fetchImpl).tenant.retrieveCapabilities();
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/tenant/capabilities");
     expect(calls[0]?.method).toBe("GET");
   });
@@ -58,10 +58,10 @@ describe("Tenant", () => {
 
   it("rotateProviderCredential carries idempotency key", async () => {
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: {} }]);
-    await client(fetchImpl).tenant.rotateProviderCredential({
-      api_key: "live_rotated",
-      idempotencyKey: "rotate-1",
-    });
+    await client(fetchImpl).tenant.rotateProviderCredential(
+      { api_key: "live_rotated" },
+      { idempotencyKey: "rotate-1" },
+    );
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.api_key).toBe("live_rotated");
     expect("idempotencyKey" in body).toBe(false);
@@ -74,17 +74,18 @@ describe("Coupons", () => {
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cpn_1" } }]);
     await client(fetchImpl).coupons.create({
       code: "WELCOME10",
-      discount_type: "percent",
-      discount_value: 10,
+      percent_off: 10,
       duration: "once",
     });
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/coupons");
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.code).toBe("WELCOME10");
     expect(body.duration).toBe("once");
-    // The API's two literals (`schemas/coupon.py`). "percentage" was never
-    // one of them and 422d at the boundary.
-    expect(body.discount_type).toBe("percent");
+    // percent_off carries the amount; discount_type is implied by it and
+    // not sent unless the caller sends it.
+    expect(body.percent_off).toBe(10);
+    expect("discount_type" in body).toBe(false);
+    expect("discount_value" in body).toBe(false);
   });
 
   it("validate posts to /v1/coupons/validate with no idempotency", async () => {
@@ -102,6 +103,36 @@ describe("Coupons", () => {
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/coupons/validate");
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body).toEqual({ code: "WELCOME10", price_id: "price_1", amount_cents: 1000 });
+  });
+
+  it("create and validate carry currency", async () => {
+    const { fetchImpl, calls } = makeMockFetch([
+      { status: 200, body: { id: "cpn_1", currency: "SEK" } },
+      {
+        status: 200,
+        body: { valid: false, reason: "coupon_currency_mismatch", code: "TENOFF" },
+      },
+    ]);
+    const c = client(fetchImpl);
+    await c.coupons.create({
+      code: "TENOFF",
+      amount_off_cents: 1000,
+      duration: "once",
+      min_amount_cents: 5000,
+      currency: "SEK",
+    });
+    const result = await c.coupons.validate<{ valid: boolean; reason: string }>({
+      code: "TENOFF",
+      amount_cents: 6000,
+      currency: "EUR",
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}").currency).toBe("SEK");
+    expect(JSON.parse(calls[1]?.body ?? "{}")).toEqual({
+      code: "TENOFF",
+      amount_cents: 6000,
+      currency: "EUR",
+    });
+    expect(result.reason).toBe("coupon_currency_mismatch");
   });
 });
 
@@ -229,7 +260,7 @@ describe("Customers: VAT + GDPR purge", () => {
   it("create does not send vat_number (separate endpoint)", async () => {
     // Regression for the 0.1 → 0.2 contract fix: the API's
     // `CustomerCreate` schema is `extra="forbid"`. Sending `vat_number`
-    // here would 422; VAT lives at `POST /v1/customers/{id}/vat_number`.
+    // here would 400; VAT lives at `POST /v1/customers/{id}/vat_number`.
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cus_1" } }]);
     await client(fetchImpl).customers.create({
       email: "ada@example.com",
@@ -257,12 +288,32 @@ describe("Customers: VAT + GDPR purge", () => {
     expect(body.country_code).toBe("NL");
   });
 
-  it("purge defaults confirmed=true so the SDK caller doesn't no-op", async () => {
-    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cus_1", purged_at: 0 } }]);
-    await client(fetchImpl).customers.purge("cus_1");
+  it("purge sends confirmed: true when the caller confirms", async () => {
+    const marker = { id: "cus_1", object: "customer", deleted: true, purged: true };
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: marker }]);
+    const purged = await client(fetchImpl).customers.purge("cus_1", { confirmed: true });
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/customers/cus_1/purge");
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body).toEqual({ confirmed: true });
+    // The deletion marker plus `purged`, never the customer.
+    expect(purged).toEqual(marker);
+  });
+
+  // 0.x defaulted the confirmation to true, so the API's guard was met by a
+  // call that never asked anyone anything. Every one of these is refused
+  // locally, and nothing reaches the wire.
+  it.each([
+    ["no params", undefined],
+    ["an empty object", {}],
+    ["confirmed: false", { confirmed: false }],
+    ["confirmed: \"true\"", { confirmed: "true" }],
+    ["confirmed: 1", { confirmed: 1 }],
+  ])("purge without an explicit confirmation (%s) sends nothing", async (_label, params) => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cus_1" } }]);
+    await expect(
+      client(fetchImpl).customers.purge("cus_1", params as never),
+    ).rejects.toThrow(/confirmed: true/);
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -297,10 +348,10 @@ describe("Products: default_price_id", () => {
   });
 });
 
-describe("CheckoutSessions: 0.2 body shape", () => {
-  it("uses method / coupon_code / trial_days_override, not the old 0.1 names", async () => {
-    // 0.1 sent payment_method / coupon / metadata which the API rejects.
-    // 0.2 mirrors the server schema names.
+describe("CheckoutSessions: body shape", () => {
+  it("uses payment_method / coupon_code / trial_days_override, the 1.0 names", async () => {
+    // 1.0 named the field payment_method, as the response does; the 0.x
+    // `method` and the 0.1 `coupon` are refused by the API.
     const { fetchImpl, calls } = makeMockFetch([
       { status: 200, body: { id: "cs_1", url: "https://www.mollie.com/checkout/cs_1" } },
     ]);
@@ -309,16 +360,16 @@ describe("CheckoutSessions: 0.2 body shape", () => {
       price_id: "price_1",
       success_url: "https://app.example.com/ok",
       cancel_url: "https://app.example.com/no",
-      method: "creditcard",
+      payment_method: "creditcard",
       coupon_code: "LAUNCH50",
       trial_days_override: 7,
     });
     const body = JSON.parse(calls[0]?.body ?? "{}");
-    expect(body.method).toBe("creditcard");
+    expect(body.payment_method).toBe("creditcard");
     expect(body.coupon_code).toBe("LAUNCH50");
     expect(body.trial_days_override).toBe(7);
-    // The 0.1 names must not slip back in.
-    expect("payment_method" in body).toBe(false);
+    // The old names must not slip back in.
+    expect("method" in body).toBe(false);
     expect("coupon" in body).toBe(false);
     expect("metadata" in body).toBe(false);
   });
@@ -370,7 +421,7 @@ describe("OneShotPayments", () => {
       customer_id: "cus_1",
       amount_cents: 2500,
       currency: "EUR",
-      method: "ideal",
+      payment_method: "ideal",
       success_url: "https://shop.example.com/thanks",
       refund_window_days: 0,
     });
@@ -378,7 +429,8 @@ describe("OneShotPayments", () => {
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.customer_id).toBe("cus_1");
     expect(body.amount_cents).toBe(2500);
-    expect(body.method).toBe("ideal");
+    expect(body.payment_method).toBe("ideal");
+    expect("method" in body).toBe(false);
     // `0` must survive dropUndefined; it disables refunds for this payment.
     expect(body.refund_window_days).toBe(0);
     // Hosted is the server default, so an omitted ui_mode is never sent.
@@ -387,7 +439,7 @@ describe("OneShotPayments", () => {
     expect(calls[0]?.headers["idempotency-key"]).toMatch(/^sdk-/);
   });
 
-  it("create in embedded mode sends ui_mode, no method, and returns the client_secret", async () => {
+  it("create in embedded mode sends ui_mode, no payment_method, and returns the client_secret", async () => {
     const { fetchImpl, calls } = makeMockFetch([
       {
         status: 200,
@@ -395,7 +447,7 @@ describe("OneShotPayments", () => {
           id: "osp_1",
           object: "one_shot_payment",
           ui_mode: "embedded",
-          method: null,
+          payment_method: null,
           redirect_url: null,
           client_secret: "osp_1_secret_abc",
         },
@@ -411,7 +463,7 @@ describe("OneShotPayments", () => {
     expect(created.client_secret).toBe("osp_1_secret_abc");
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.ui_mode).toBe("embedded");
-    expect("method" in body).toBe(false);
+    expect("payment_method" in body).toBe(false);
   });
 
   it("retrieve fetches /v1/checkout/one_shot/{id}", async () => {
@@ -470,7 +522,7 @@ describe("Subscriptions: usage records", () => {
   it("createUsageRecord posts to the nested route with the usage fields", async () => {
     const { fetchImpl, calls } = makeMockFetch([
       {
-        status: 201,
+        status: 200,
         body: {
           id: "ur_1",
           object: "usage_record",
@@ -500,12 +552,13 @@ describe("Subscriptions: usage records", () => {
 
   it("createUsageRecord threads a caller-supplied idempotency key and omits optionals", async () => {
     const { fetchImpl, calls } = makeMockFetch([
-      { status: 201, body: { id: "ur_1", object: "usage_record" } },
+      { status: 200, body: { id: "ur_1", object: "usage_record" } },
     ]);
-    await client(fetchImpl).subscriptions.createUsageRecord("sub_1", {
-      quantity: 1,
-      idempotencyKey: "usage-1",
-    });
+    await client(fetchImpl).subscriptions.createUsageRecord(
+      "sub_1",
+      { quantity: 1 },
+      { idempotencyKey: "usage-1" },
+    );
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body).toEqual({ quantity: 1 });
     expect("idempotencyKey" in body).toBe(false);
@@ -610,33 +663,28 @@ describe("WebhookEndpoints deliveries", () => {
   });
 
   it("retrieveDelivery fetches one row", async () => {
-    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "wde_1" } }]);
-    await client(fetchImpl).webhookEndpoints.retrieveDelivery("we_1", "wde_1");
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "whd_1" } }]);
+    await client(fetchImpl).webhookEndpoints.retrieveDelivery("we_1", "whd_1");
     expect(calls[0]?.url).toBe(
-      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/wde_1",
+      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/whd_1",
     );
     expect(calls[0]?.method).toBe("GET");
   });
 
-  it("getDelivery is still an alias for retrieveDelivery", async () => {
-    // Kept because removing it would break callers for a naming
-    // preference. Same request on the wire, so the alias cannot drift.
-    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "wde_1" } }]);
-    await client(fetchImpl).webhookEndpoints.getDelivery("we_1", "wde_1");
-    expect(calls[0]?.url).toBe(
-      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/wde_1",
-    );
+  it("getDelivery, the 0.x alias, is gone in 1.0", () => {
+    const { fetchImpl } = makeMockFetch([]);
+    expect("getDelivery" in client(fetchImpl).webhookEndpoints).toBe(false);
   });
 
   it("redeliver re-enqueues a row idempotently", async () => {
     const { fetchImpl, calls } = makeMockFetch([
-      { status: 200, body: { id: "wde_1", status: "pending" } },
+      { status: 200, body: { id: "whd_1", status: "pending" } },
     ]);
-    await client(fetchImpl).webhookEndpoints.redeliver("we_1", "wde_1", {
+    await client(fetchImpl).webhookEndpoints.redeliver("we_1", "whd_1", {}, {
       idempotencyKey: "redeliver-1",
     });
     expect(calls[0]?.url).toBe(
-      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/wde_1/redeliver",
+      "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/whd_1/redeliver",
     );
     expect(calls[0]?.method).toBe("POST");
     expect(calls[0]?.headers["idempotency-key"]).toBe("redeliver-1");
@@ -650,7 +698,8 @@ describe("Prices: archive", () => {
     ]);
     const archived = await client(fetchImpl).prices.update<{ id: string; active: boolean }>(
       "price_1",
-      { active: false, idempotencyKey: "archive-1" },
+      { active: false },
+      { idempotencyKey: "archive-1" },
     );
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/prices/price_1");
     expect(calls[0]?.method).toBe("POST");
@@ -708,7 +757,7 @@ describe("DELETE is only for resources that really go away", () => {
     const { fetchImpl, calls } = makeMockFetch([
       { status: 200, body: { id: "we_1", object: "webhook_endpoint", deleted: true } },
     ]);
-    const gone = await client(fetchImpl).webhookEndpoints.delete<{ deleted: boolean }>("we_1", {
+    const gone = await client(fetchImpl).webhookEndpoints.delete<{ deleted: boolean }>("we_1", {}, {
       idempotencyKey: "drop-1",
     });
     expect(calls[0]?.method).toBe("DELETE");
@@ -757,7 +806,7 @@ describe("Subscriptions: list filters", () => {
     const seen: string[] = [];
     for await (const sub of client(fetchImpl).subscriptions.iter<{ id: string }>({
       renewal_state: "paused",
-      pageSize: 1,
+      limit: 1,
     })) {
       seen.push(sub.id);
     }
@@ -822,16 +871,16 @@ describe("Metered pricing: sub-cent rates, tiers, dedupe, summary", () => {
       billing_scheme: "tiered",
       tiers_mode: "graduated",
       tiers: [
-        { up_to: 1000, unit_amount: 1 },
-        { up_to: "inf", unit_amount_decimal: "0.5", flat_amount: 500 },
+        { up_to: 1000, unit_amount_cents: 1 },
+        { up_to: "inf", unit_amount_decimal: "0.5", flat_amount_cents: 500 },
       ],
     });
     const body = JSON.parse(calls[0]?.body ?? "{}");
     expect(body.billing_scheme).toBe("tiered");
     expect(body.tiers_mode).toBe("graduated");
     expect(body.tiers).toEqual([
-      { up_to: 1000, unit_amount: 1 },
-      { up_to: "inf", unit_amount_decimal: "0.5", flat_amount: 500 },
+      { up_to: 1000, unit_amount_cents: 1 },
+      { up_to: "inf", unit_amount_decimal: "0.5", flat_amount_cents: 500 },
     ]);
   });
 
@@ -873,7 +922,7 @@ describe("Metered pricing: sub-cent rates, tiers, dedupe, summary", () => {
     // key, so only a natural key stops the second report being a second
     // charge.
     const { fetchImpl, calls } = makeMockFetch([
-      { status: 201, body: { id: "ur_1", object: "usage_record", identifier: "job-42" } },
+      { status: 200, body: { id: "ur_1", object: "usage_record", identifier: "job-42" } },
     ]);
     await client(fetchImpl).subscriptions.createUsageRecord("sub_1", {
       quantity: 10,
@@ -885,7 +934,7 @@ describe("Metered pricing: sub-cent rates, tiers, dedupe, summary", () => {
   it("omits identifier when it is not given", async () => {
     // Dedupe is opt-in: two identical reports at different times are
     // legitimately two records.
-    const { fetchImpl, calls } = makeMockFetch([{ status: 201, body: { id: "ur_1" } }]);
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "ur_1" } }]);
     await client(fetchImpl).subscriptions.createUsageRecord("sub_1", { quantity: 10 });
     expect("identifier" in JSON.parse(calls[0]?.body ?? "{}")).toBe(false);
   });
@@ -1022,13 +1071,13 @@ describe("routes added in 0.7.0", () => {
     expect(calls[0]?.method).toBe("GET");
   });
 
-  it("tenant.billingProfile / setBillingProfile hit /v1/tenant/billing_profile", async () => {
+  it("tenant.retrieveBillingProfile / setBillingProfile hit /v1/tenant/billing_profile", async () => {
     const { fetchImpl, calls } = makeMockFetch([
       { status: 200, body: { country_code: null, effective_country_code: "NL" } },
       { status: 200, body: { country_code: "NL" } },
     ]);
     const c = client(fetchImpl);
-    await c.tenant.billingProfile();
+    await c.tenant.retrieveBillingProfile();
     await c.tenant.setBillingProfile({ country_code: "NL", vat_id: null, city: "Amsterdam" });
     expect(calls[0]?.method).toBe("GET");
     expect(calls[1]?.url).toBe("https://test.billkit.eu/v1/tenant/billing_profile");
@@ -1037,13 +1086,24 @@ describe("routes added in 0.7.0", () => {
     expect(body).toEqual({ country_code: "NL", vat_id: null, city: "Amsterdam" });
   });
 
-  it("tenant.export returns the raw bytes", async () => {
+  it("tenant.export returns the body as an unread stream", async () => {
     const { fetchImpl, calls } = makeMockFetch([
       { status: 200, body: { billkit_export_version: 2 } },
     ]);
-    const bytes = await client(fetchImpl).tenant.export();
+    const stream = await client(fetchImpl).tenant.export();
     expect(calls[0]?.url).toBe("https://test.billkit.eu/v1/tenant/export");
-    expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ billkit_export_version: 2 });
+    expect(stream).toBeInstanceOf(ReadableStream);
+    const text = await new Response(stream).text();
+    expect(JSON.parse(text)).toEqual({ billkit_export_version: 2 });
+  });
+
+  it("tenant.export still raises the typed error on a failure", async () => {
+    const { fetchImpl } = makeMockFetch([
+      { status: 403, body: { error: { type: "permission_error", code: "insufficient_scope", message: "no" } } },
+    ]);
+    const err = await client(fetchImpl).tenant.export().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PermissionDeniedError);
+    expect((err as PermissionDeniedError).code).toBe("insufficient_scope");
   });
 
   it("webhookEndpoints.listEventTypes GETs the catalogue", async () => {

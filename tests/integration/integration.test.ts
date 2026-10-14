@@ -25,12 +25,13 @@ import {
   AuthenticationError,
   ConflictError,
   InvalidRequestError,
-  PermissionError,
-  ResourceMissingError,
+  NotFoundError,
+  PermissionDeniedError,
   ServerError,
 } from "../../src/errors.js";
-import type { AuditLogsListParams, CustomerListParams } from "../../src/resources.js";
+import type { AuditLogsListParams, CustomerListParams } from "../../src/params.js";
 import { Transport } from "../../src/transport.js";
+import { EVENT_TYPES } from "../../src/eventTypes.js";
 import { verifyWebhookSignature, WebhookVerificationError } from "../../src/webhooks.js";
 import {
   BASE_URL,
@@ -85,9 +86,7 @@ async function makePlan(
  */
 async function activeSubscription(c: BillKit, t: TestTenant, priceId: string) {
   await checkoutToActive(c, t, priceId);
-  const subs = await c.subscriptions.list<{
-    data: Array<{ id: string; status: string; price_id: string }>;
-  }>({ limit: 100 });
+  const subs = await c.subscriptions.list({ limit: 100 });
   const sub = subs.data.find((s) => s.price_id === priceId);
   expect(sub, "a subscription should exist for the settled checkout").toBeTruthy();
   expect(sub!.status).toBe("active");
@@ -125,7 +124,7 @@ d("BillKit node SDK against a live API", () => {
 
   describe("auth", () => {
     scenario("auth.valid_key", "a provisioned key reaches a real resource", async () => {
-      const page = await client.products.list<{ object: string; data: unknown[] }>();
+      const page = await client.products.list();
       expect(page.object).toBe("list");
       expect(Array.isArray(page.data)).toBe(true);
     });
@@ -140,13 +139,13 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "auth.scoped_key_denied",
-      "a narrowly-scoped key raises PermissionError off-scope",
+      "a narrowly-scoped key raises PermissionDeniedError off-scope",
       async () => {
         // products:read only; customers is outside the grant.
         const secret = await mintScopedKey(tenant, ["products:read"]);
         const scoped = new BillKit({ apiKey: secret, baseUrl: BASE_URL });
         await expect(scoped.products.list()).resolves.toBeTruthy();
-        await expect(scoped.customers.list()).rejects.toBeInstanceOf(PermissionError);
+        await expect(scoped.customers.list()).rejects.toBeInstanceOf(PermissionDeniedError);
       },
     );
   });
@@ -184,7 +183,7 @@ d("BillKit node SDK against a live API", () => {
       const fetched = await client.prices.retrieve<{ product_id: string }>(price.id);
       expect(fetched.product_id).toBe(product.id);
 
-      const filtered = await client.prices.list<{ data: Array<{ id: string }> }>({
+      const filtered = await client.prices.list({
         product_id: product.id,
       });
       expect(filtered.data.map((p) => p.id)).toContain(price.id);
@@ -203,7 +202,7 @@ d("BillKit node SDK against a live API", () => {
       // that still points at it can be read back rather than dangling.
       const fetched = await client.prices.retrieve<{ id: string; active: boolean }>(price.id);
       expect(fetched.active).toBe(false);
-      const listed = await client.prices.list<{ data: Array<{ id: string }> }>({
+      const listed = await client.prices.list({
         product_id: product.id,
       });
       expect(listed.data.map((p) => p.id)).toContain(price.id);
@@ -317,34 +316,33 @@ d("BillKit node SDK against a live API", () => {
     );
 
     scenario(
-      "crud.coupon_discount_type_literals",
-      "discount_type takes percent and fixed_cents, and nothing else",
+      "crud.coupon_percent_off",
+      "a percent coupon reads back percent_off, with amount_off_cents null",
       async () => {
-        const percent = await client.coupons.create<{ discount_type: string }>({
+        const created = await client.coupons.create({
           code: `PCT${idemKey().slice(-10)}`,
-          discount_type: "percent",
-          discount_value: 10,
+          percent_off: 15,
           duration: "once",
         });
-        expect(percent.discount_type).toBe("percent");
+        expect(created.object).toBe("coupon");
+        expect(created.discount_type).toBe("percent");
+        expect(created.percent_off).toBe(15);
+        expect(created.amount_off_cents).toBeNull();
 
-        const fixed = await client.coupons.create<{ discount_type: string }>({
-          code: `FIX${idemKey().slice(-10)}`,
-          discount_type: "fixed_cents",
-          discount_value: 500,
+        const fetched = await client.coupons.retrieve(created.id);
+        expect(fetched.percent_off).toBe(15);
+        expect(fetched.amount_off_cents).toBeNull();
+        expect("discount_value" in fetched).toBe(false);
+
+        // Up to two decimal places, read back as the number sent: 12.5 is
+        // 12.5, not a rounded 13 or a "12.50" string.
+        const fractional = await client.coupons.create({
+          code: `PCTD${idemKey().slice(-10)}`,
+          percent_off: 12.5,
           duration: "once",
         });
-        expect(fixed.discount_type).toBe("fixed_cents");
-
-        // The value these SDKs used to document. It is not a synonym.
-        await expect(
-          client.coupons.create({
-            code: `BAD${idemKey().slice(-10)}`,
-            discount_type: "percentage",
-            discount_value: 10,
-            duration: "once",
-          }),
-        ).rejects.toBeInstanceOf(InvalidRequestError);
+        expect(fractional.percent_off).toBe(12.5);
+        expect((await client.coupons.retrieve(fractional.id)).percent_off).toBe(12.5);
       },
     );
 
@@ -369,16 +367,46 @@ d("BillKit node SDK against a live API", () => {
       // The customer leaves the API, so the body is a marker, not a row.
       expect(deleted).toEqual({ id: created.id, object: "customer", deleted: true });
 
-      const page = await client.customers.list<{ data: Array<{ id: string }> }>({ limit: 100 });
+      const page = await client.customers.list({ limit: 100 });
       expect(page.data.map((c) => c.id)).not.toContain(created.id);
+    });
+
+    scenario("crud.test_clock", "test clock round-trips, carries a customer, and deletes", async () => {
+      type Clock = { id: string; object: string; frozen_time: number; name: string | null };
+      const start = Math.floor(Date.now() / 1000);
+      const clock = await client.testClocks.create<Clock>({ frozen_time: start, name: "SDK IT" });
+      expect(clock.object).toBe("test_clock");
+      expect(clock.frozen_time).toBe(start);
+
+      expect((await client.testClocks.retrieve<Clock>(clock.id)).id).toBe(clock.id);
+      const page = await client.testClocks.list({ limit: 100 });
+      expect(page.data.map((c) => c.id)).toContain(clock.id);
+
+      const customer = await client.customers.create({
+        email: `clock-${idemKey()}@sdk-it.example.com`,
+        test_clock_id: clock.id,
+      });
+      expect(customer.test_clock_id).toBe(clock.id);
+      expect("test_clock" in customer).toBe(false);
+      expect((await client.customers.retrieve(customer.id)).test_clock_id).toBe(clock.id);
+
+      const advanced = await client.testClocks.advance<Clock>(clock.id, {
+        frozen_time: start + 86_400,
+      });
+      expect(advanced.frozen_time).toBe(start + 86_400);
+
+      const deleted = await client.testClocks.delete(clock.id);
+      expect(deleted).toEqual({ id: clock.id, object: "test_clock", deleted: true });
+      await expect(client.testClocks.retrieve(clock.id)).rejects.toBeInstanceOf(
+        NotFoundError,
+      );
     });
 
     scenario("crud.coupon", "coupon creates, validates, updates, withdraws", async () => {
       const code = `SAVE${Date.now().toString().slice(-8)}`;
       const created = await client.coupons.create<{ id: string; code: string }>({
         code,
-        discount_type: "percent",
-        discount_value: 25,
+        percent_off: 25,
         duration: "once",
       });
       expect(created.code).toBe(code);
@@ -444,7 +472,7 @@ d("BillKit node SDK against a live API", () => {
         status: "disabled",
       });
       expect(disabled.status).toBe("disabled");
-      const page = await client.webhookEndpoints.list<{ data: Array<{ id: string }> }>({
+      const page = await client.webhookEndpoints.list({
         limit: 100,
       });
       expect(page.data.map((e) => e.id)).toContain(created.id);
@@ -457,7 +485,7 @@ d("BillKit node SDK against a live API", () => {
       );
       expect(gone).toEqual({ id: created.id, object: "webhook_endpoint", deleted: true });
       await expect(client.webhookEndpoints.retrieve(created.id)).rejects.toThrow();
-      const after = await client.webhookEndpoints.list<{ data: Array<{ id: string }> }>({
+      const after = await client.webhookEndpoints.list({
         limit: 100,
       });
       expect(after.data.map((e) => e.id)).not.toContain(created.id);
@@ -582,8 +610,7 @@ d("BillKit node SDK against a live API", () => {
         const redeemBy = Math.floor(Date.now() / 1000) + 30 * 86_400;
         const coupon = await c.coupons.create<{ id: string }>({
           code: `CLR${Date.now().toString().slice(-8)}`,
-          discount_type: "percent",
-          discount_value: 10,
+          percent_off: 10,
           duration: "once",
           max_redemptions: 5,
           redeem_by: redeemBy,
@@ -625,15 +652,15 @@ d("BillKit node SDK against a live API", () => {
       "crud.credit_note_absent_until_refunded",
       "credit notes are issued, never created",
       async () => {
-        // There is no `create` on the resource at all — issuance hangs off a
+        // There is no `create` on the resource at all; issuance hangs off a
         // settled refund. Assert the read surface is reachable and honest
         // about having nothing yet.
-        const page = await client.creditNotes.list<{ object: string; data: unknown[] }>({
+        const page = await client.creditNotes.list({
           limit: 10,
         });
         expect(page.object).toBe("list");
         await expect(client.creditNotes.retrieve("cn_does_not_exist")).rejects.toBeInstanceOf(
-          ResourceMissingError,
+          NotFoundError,
         );
       },
     );
@@ -659,21 +686,30 @@ d("BillKit node SDK against a live API", () => {
         expect(paused.renewal_state).toBe("paused");
         expect(paused.status).toBe("active");
 
-        const byRenewalState = await c.subscriptions.list<{ data: Array<{ id: string }> }>({
-          renewal_state: "paused",
+        const byRenewalState = await c.subscriptions.list({
+          renewal_state: ["paused"],
         });
         expect(byRenewalState.data.map((s) => s.id)).toContain(sub.id);
 
         // ...and it is still an `active` subscription to the status filter.
-        const byStatus = await c.subscriptions.list<{ data: Array<{ id: string }> }>({
-          status: "active",
+        const byStatus = await c.subscriptions.list({
+          status: ["active"],
         });
         expect(byStatus.data.map((s) => s.id)).toContain(sub.id);
+
+        // Both filters take a list and match any of its values.
+        const either = await c.subscriptions.list({
+          status: ["past_due", "active"],
+          renewal_state: ["canceling", "paused"],
+        });
+        expect(either.data.map((s) => s.id)).toContain(sub.id);
+        const neither = await c.subscriptions.list({ renewal_state: ["auto_renew", "canceling"] });
+        expect(neither.data.map((s) => s.id)).not.toContain(sub.id);
 
         // `status=paused` is not a value the API accepts. It used to be,
         // and returned a confident, wrong, empty page; now it is refused
         // so the mistake is visible.
-        const err = await c.subscriptions.list({ status: "paused" }).catch((e: unknown) => e);
+        const err = await c.subscriptions.list({ status: ["paused"] }).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(InvalidRequestError);
         expect((err as InvalidRequestError).param).toBe("status");
       },
@@ -850,7 +886,7 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "routes.one_shot_embedded",
-      "an embedded one-shot returns a client_secret once, with no method or redirect",
+      "an embedded one-shot returns a client_secret once, with no payment_method or redirect",
       async () => {
         const t = await provisionTenant("one-shot-embedded");
         const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
@@ -861,9 +897,10 @@ d("BillKit node SDK against a live API", () => {
         type OneShot = {
           id: string;
           ui_mode: string;
-          method: string | null;
+          payment_method: string | null;
           redirect_url: string | null;
           client_secret: string | null;
+          metadata: Record<string, string>;
         };
         const created = await c.oneShotPayments.create<OneShot>({
           customer_id: buyer.id,
@@ -874,7 +911,8 @@ d("BillKit node SDK against a live API", () => {
         });
         expect(created.ui_mode).toBe("embedded");
         expect(created.redirect_url).toBeNull();
-        expect(created.method).toBeNull();
+        expect(created.payment_method).toBeNull();
+        expect(created.metadata).toEqual({});
         expect(created.client_secret?.startsWith(`${created.id}_secret_`)).toBe(true);
 
         const read = await c.oneShotPayments.retrieve<OneShot>(created.id);
@@ -898,7 +936,7 @@ d("BillKit node SDK against a live API", () => {
             customer_id: buyer.id,
             amount_cents: 1500,
             currency: "EUR",
-            method: "creditcard",
+            payment_method: "creditcard",
             success_url: "https://merchant.example.com/ok",
           });
         const first = await charge();
@@ -924,6 +962,15 @@ d("BillKit node SDK against a live API", () => {
         await expect(
           c.oneShotPayments.list({ customer_id: buyer.id, status: "settled" }),
         ).rejects.toBeInstanceOf(InvalidRequestError);
+
+        // Nothing to refund on a charge nobody has paid: the request is well
+        // formed and the payment's state refuses it, so it is a 409
+        // state_conflict rather than a 400.
+        const unpaid = await c.refunds
+          .create({ one_shot_payment_id: first.id })
+          .catch((e: unknown) => e);
+        expect(unpaid).toBeInstanceOf(ConflictError);
+        expect((unpaid as ConflictError).code).toBe("state_conflict");
       },
     );
 
@@ -972,7 +1019,7 @@ d("BillKit node SDK against a live API", () => {
         expect(set.country_code).toBe("NL");
         expect(set.vat_id).toBe("NL123456789B01");
 
-        const read = await c.tenant.billingProfile<Profile>();
+        const read = await c.tenant.retrieveBillingProfile<Profile>();
         expect(read.vat_id).toBe("NL123456789B01");
         // Stored and effective agree once something is stored; they differ
         // only when nothing ever was.
@@ -995,7 +1042,7 @@ d("BillKit node SDK against a live API", () => {
         }
 
         // The refused call wrote nothing, including the city it carried.
-        const after = await c.tenant.billingProfile<Profile>();
+        const after = await c.tenant.retrieveBillingProfile<Profile>();
         expect(after.vat_id).toBe("NL123456789B01");
         expect(after.city).toBe("Amsterdam");
 
@@ -1018,7 +1065,7 @@ d("BillKit node SDK against a live API", () => {
       for (let i = 0; i < 5; i++) {
         await c.products.create({ name: `Paged ${i}` });
       }
-      const page = await c.products.list<{ data: unknown[]; has_more: boolean }>({ limit: 2 });
+      const page = await c.products.list({ limit: 2 });
       expect(page.data).toHaveLength(2);
       expect(page.has_more).toBe(true);
     });
@@ -1034,7 +1081,7 @@ d("BillKit node SDK against a live API", () => {
       }
 
       const seen: string[] = [];
-      for await (const product of c.products.iter<{ id: string }>({ pageSize: 2 })) {
+      for await (const product of c.products.iter<{ id: string }>({ limit: 2 })) {
         seen.push(product.id);
       }
       // Exactly-once is the real assertion: a cursor that mis-orders ties
@@ -1050,19 +1097,36 @@ d("BillKit node SDK against a live API", () => {
     scenario("idempotency.replay", "the same key + body replays the same resource", async () => {
       const key = idemKey();
       const body = { name: "Idempotent Product" };
-      const first = await client.products.create<{ id: string }>({ ...body, idempotencyKey: key });
-      const second = await client.products.create<{ id: string }>({ ...body, idempotencyKey: key });
+      const first = await client.products.create(body, { idempotencyKey: key });
+      const second = await client.products.create(body, { idempotencyKey: key });
       expect(second.id).toBe(first.id);
     });
+
+    scenario(
+      "idempotency.blank_key_generated",
+      "a blank caller key is replaced with a generated one, not sent",
+      async () => {
+        // A blank key on the wire is a 400 now, and before that it meant
+        // "no idempotency" while the SDK still retried the POST. Each call
+        // here gets its own generated key, so both succeed as two products.
+        const first = await client.products.create({ name: "Blank Key" }, { idempotencyKey: "" });
+        const second = await client.products.create(
+          { name: "Blank Key" },
+          { idempotencyKey: "   " },
+        );
+        expect(first.id).toBeTruthy();
+        expect(second.id).not.toBe(first.id);
+      },
+    );
 
     scenario(
       "idempotency.key_reuse_conflict",
       "the same key with a different body conflicts",
       async () => {
         const key = idemKey();
-        await client.products.create({ name: "First Body", idempotencyKey: key });
+        await client.products.create({ name: "First Body" }, { idempotencyKey: key });
         await expect(
-          client.products.create({ name: "Different Body", idempotencyKey: key }),
+          client.products.create({ name: "Different Body" }, { idempotencyKey: key }),
         ).rejects.toBeInstanceOf(ConflictError);
       },
     );
@@ -1075,7 +1139,7 @@ d("BillKit node SDK against a live API", () => {
         // from N workers yields ONE resource and no exception.
         //
         // A request that arrives while the winner's handler is still
-        // running gets `409 idempotency_in_progress` — the one 4xx the
+        // running gets `409 idempotency_in_progress`, the one 4xx the
         // client retries, because the charge may already have happened and
         // the obvious workaround (retry with a fresh key) is what turns one
         // charge into two. Whether any given attempt lands inside that
@@ -1090,7 +1154,7 @@ d("BillKit node SDK against a live API", () => {
 
         const results = await Promise.all(
           Array.from({ length: 8 }, () =>
-            c.products.create<{ id: string }>({ name, idempotencyKey: key }),
+            c.products.create({ name }, { idempotencyKey: key }),
           ),
         );
 
@@ -1104,12 +1168,114 @@ d("BillKit node SDK against a live API", () => {
     );
   });
 
+  // ── safety ────────────────────────────────────────────────────────
+
+  describe("safety", () => {
+    scenario(
+      "safety.purge_requires_confirmation",
+      "purge without confirmation fails locally and sends nothing; with it, it purges",
+      async () => {
+        // Count what actually reaches the network, rather than trusting the
+        // server to refuse: the point is that nothing is sent at all.
+        const sent: string[] = [];
+        const counting = new BillKit({
+          apiKey: tenant.apiKey,
+          baseUrl: BASE_URL,
+          fetch: (input, init) => {
+            sent.push(`${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
+            return fetch(input, init);
+          },
+        });
+        const customer = await counting.customers.create({
+          email: `purge-${idemKey()}@sdk-it.example.com`,
+          name: "To Be Erased",
+        });
+        sent.length = 0;
+
+        for (const params of [undefined, {}, { confirmed: false }]) {
+          await expect(
+            counting.customers.purge(customer.id, params as never),
+          ).rejects.toBeInstanceOf(TypeError);
+        }
+        expect(sent).toEqual([]);
+
+        const purged = await counting.customers.purge(customer.id, { confirmed: true });
+        expect(sent).toEqual([`POST /v1/customers/${customer.id}/purge`]);
+        // The deletion marker plus `purged`, never the customer: the erased
+        // placeholder email would read as live data.
+        expect(purged).toEqual({
+          id: customer.id,
+          object: "customer",
+          deleted: true,
+          purged: true,
+        });
+        // ...and the customer is gone from the API, exactly like a delete.
+        await expect(client.customers.retrieve(customer.id)).rejects.toBeInstanceOf(
+          NotFoundError,
+        );
+      },
+    );
+  });
+
+  // ── events ────────────────────────────────────────────────────────
+
+  describe("events", () => {
+    scenario(
+      "events.previous_attributes_nullable",
+      "previous_attributes is null on a creation and carries the old value on an update",
+      async () => {
+        const t = await provisionTenant("prev-attrs");
+        const c = new BillKit({ apiKey: t.apiKey, baseUrl: BASE_URL });
+
+        const customer = await c.customers.create({
+          email: `prev-${idemKey()}@sdk-it.example.com`,
+        });
+        let createdId: string | undefined;
+        for await (const event of c.events.iter({ type: ["customer.created"], limit: 100 })) {
+          if ((event.data as { id?: string }).id === customer.id) createdId = event.id;
+        }
+        expect(createdId, "customer.created should be recorded").toBeTruthy();
+        const created = await c.events.retrieve(createdId!);
+        // Present and null: the key is never omitted.
+        expect("previous_attributes" in created).toBe(true);
+        expect(created.previous_attributes).toBeNull();
+
+        const { price } = await makePlan(c, { amountCents: 1500 });
+        const sub = await activeSubscription(c, t, price.id);
+        await c.subscriptions.pause(sub.id);
+        let updatedId: string | undefined;
+        for await (const event of c.events.iter({ type: ["subscription.updated"], limit: 100 })) {
+          const data = event.data as { id?: string; renewal_state?: string };
+          if (data.id === sub.id && data.renewal_state === "paused") updatedId = event.id;
+        }
+        expect(updatedId, "the pause should emit subscription.updated").toBeTruthy();
+        const updated = await c.events.retrieve(updatedId!);
+        expect(updated.previous_attributes).toMatchObject({ renewal_state: "auto_renew" });
+
+        // `type` takes several values and matches any of them: both events
+        // come back from one filtered walk, and nothing of another type.
+        const types = new Set<string>();
+        const ids = new Set<string>();
+        for await (const event of c.events.iter({
+          type: ["customer.created", "subscription.updated"],
+          limit: 100,
+        })) {
+          types.add(event.type);
+          ids.add(event.id);
+        }
+        expect([...types].sort()).toEqual(["customer.created", "subscription.updated"]);
+        expect(ids.has(createdId!)).toBe(true);
+        expect(ids.has(updatedId!)).toBe(true);
+      },
+    );
+  });
+
   // ── errors ────────────────────────────────────────────────────────
 
   describe("errors", () => {
-    scenario("errors.not_found", "404 maps to ResourceMissingError", async () => {
+    scenario("errors.not_found", "404 maps to NotFoundError", async () => {
       await expect(client.products.retrieve("prod_does_not_exist")).rejects.toBeInstanceOf(
-        ResourceMissingError,
+        NotFoundError,
       );
     });
 
@@ -1117,7 +1283,7 @@ d("BillKit node SDK against a live API", () => {
       "errors.invalid_request",
       "a validation failure maps to InvalidRequestError and carries `param`",
       async () => {
-        // A 4-char currency fails schema validation (422,
+        // A 4-char currency fails schema validation (400,
         // type=invalid_request_error). Asserting on `param` is the point:
         // it proves the envelope's field-level detail survives the wire
         // round-trip into the typed exception, which is what lets a caller
@@ -1138,14 +1304,14 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "errors.status_drives_class",
-      "a 4xx the API labels `api_error` still maps on its status",
+      "the status, not the envelope type, picks the class",
       async () => {
-        // Not a contrived body: every request that never reaches a route
-        // handler is serialised by the API's framework-level handler as
-        // `{"type": "api_error", "code": "unhandled"}` with the original
-        // 4xx status. Mapping on `type` made a plain 404 — a typo'd id, an
-        // SDK/API version skew — arrive as ServerError, which is the class
-        // retry and alerting policies key on.
+        // An unmatched route answers 404 with
+        // `{"type": "invalid_request_error", "code": "route_not_found"}`.
+        // Mapping on `type` would raise InvalidRequestError; mapping on the
+        // status raises NotFoundError. Before 1.0 the same miss read
+        // `{"type": "api_error"}`, and mapping on `type` made a plain 404
+        // arrive as ServerError, the class retry and alerting policies key on.
         //
         // Driven through the Transport rather than a resource because
         // that is what a version skew looks like: the SDK asking for a
@@ -1155,12 +1321,14 @@ d("BillKit node SDK against a live API", () => {
           .request({ method: "GET", path: "/v1/no_such_resource" })
           .catch((e: unknown) => e);
 
-        expect(err).toBeInstanceOf(ResourceMissingError);
+        expect(err).toBeInstanceOf(NotFoundError);
+        expect(err).not.toBeInstanceOf(InvalidRequestError);
         expect(err).not.toBeInstanceOf(ServerError);
-        // The envelope value is still carried verbatim; it just does not
+        // The envelope values are still carried verbatim; they just do not
         // choose the class.
-        expect((err as ResourceMissingError).type).toBe("api_error");
-        expect((err as ResourceMissingError).statusCode).toBe(404);
+        expect((err as NotFoundError).type).toBe("invalid_request_error");
+        expect((err as NotFoundError).code).toBe("route_not_found");
+        expect((err as NotFoundError).statusCode).toBe(404);
       },
     );
   });
@@ -1172,16 +1340,12 @@ d("BillKit node SDK against a live API", () => {
       const { price } = await makePlan(client, { amountCents: 4200 });
       await checkoutToActive(client, tenant, price.id);
 
-      const subs = await client.subscriptions.list<{
-        data: Array<{ id: string; status: string; price_id: string }>;
-      }>({ limit: 100 });
+      const subs = await client.subscriptions.list({ limit: 100 });
       const sub = subs.data.find((s) => s.price_id === price.id);
       expect(sub, "a subscription should exist for the settled checkout").toBeTruthy();
       expect(sub!.status).toBe("active");
 
-      const payments = await client.payments.list<{
-        data: Array<{ subscription_id: string | null; status: string; amount_cents: number }>;
-      }>({ limit: 100 });
+      const payments = await client.payments.list({ limit: 100 });
       const paid = payments.data.find((p) => p.subscription_id === sub!.id);
       expect(paid, "the settled payment should be listed").toBeTruthy();
       expect(paid!.status).toBe("paid");
@@ -1240,14 +1404,10 @@ d("BillKit node SDK against a live API", () => {
       const { price } = await makePlan(client, { amountCents: 10_000 });
       await checkoutToActive(client, tenant, price.id);
 
-      const subs = await client.subscriptions.list<{
-        data: Array<{ id: string; price_id: string }>;
-      }>({ limit: 100 });
+      const subs = await client.subscriptions.list({ limit: 100 });
       const sub = subs.data.find((s) => s.price_id === price.id)!;
 
-      const payments = await client.payments.list<{
-        data: Array<{ id: string; subscription_id: string | null }>;
-      }>({ limit: 100 });
+      const payments = await client.payments.list({ limit: 100 });
       const payment = payments.data.find((p) => p.subscription_id === sub.id)!;
 
       const refund = await client.refunds.create<{ id: string; amount_cents: number }>({
@@ -1269,13 +1429,9 @@ d("BillKit node SDK against a live API", () => {
       const { price } = await makePlan(client, { amountCents: 5000 });
       await checkoutToActive(client, tenant, price.id);
 
-      const subs = await client.subscriptions.list<{
-        data: Array<{ id: string; price_id: string }>;
-      }>({ limit: 100 });
+      const subs = await client.subscriptions.list({ limit: 100 });
       const sub = subs.data.find((s) => s.price_id === price.id)!;
-      const payments = await client.payments.list<{
-        data: Array<{ id: string; subscription_id: string | null }>;
-      }>({ limit: 100 });
+      const payments = await client.payments.list({ limit: 100 });
       const payment = payments.data.find((p) => p.subscription_id === sub.id)!;
 
       // The guard that stops BillKit paying out more than it took.
@@ -1293,17 +1449,23 @@ d("BillKit node SDK against a live API", () => {
       await mollie.chargeback(providerPaymentId, "77.00", "fraudulent");
       await deliverMollieWebhook(tenant.mollieRouteId, providerPaymentId);
 
-      const disputes = await client.disputes.list<{
-        data: Array<{ id: string; status: string; amount_cents: number }>;
-      }>({ limit: 100 });
+      const disputes = await client.disputes.list({ limit: 100 });
       expect(disputes.data.length).toBeGreaterThan(0);
 
       const dispute = disputes.data.find((x) => x.amount_cents === 7700);
       expect(dispute, "a dispute should exist for the charged-back payment").toBeTruthy();
       expect(dispute!.status).toBe("open");
 
-      const fetched = await client.disputes.retrieve<{ id: string }>(dispute!.id);
+      const fetched = await client.disputes.retrieve(dispute!.id);
       expect(fetched.id).toBe(dispute!.id);
+      // An open dispute has not been reversed: the key is present and null.
+      expect("reversed_at" in fetched).toBe(true);
+      expect(fetched.reversed_at).toBeNull();
+      expect("reversed" in fetched).toBe(false);
+
+      // `status` takes a list.
+      const open = await client.disputes.list({ status: ["open", "won"], limit: 100 });
+      expect(open.data.map((x) => x.id)).toContain(dispute!.id);
     });
 
     scenario(
@@ -1313,18 +1475,12 @@ d("BillKit node SDK against a live API", () => {
         const { price } = await makePlan(client, { amountCents: 6400 });
         const { providerPaymentId } = await checkoutToActive(client, tenant, price.id);
 
-        const subs = await client.subscriptions.list<{
-          data: Array<{ id: string; price_id: string }>;
-        }>({ limit: 100 });
+        const subs = await client.subscriptions.list({ limit: 100 });
         const sub = subs.data.find((s) => s.price_id === price.id)!;
-        const payments = await client.payments.list<{
-          data: Array<{ id: string; subscription_id: string | null }>;
-        }>({ limit: 100 });
+        const payments = await client.payments.list({ limit: 100 });
         const payment = payments.data.find((p) => p.subscription_id === sub.id)!;
 
-        const invoices = await client.invoices.list<{
-          data: Array<{ id: string; payment_id: string | null; number: string }>;
-        }>({ limit: 100 });
+        const invoices = await client.invoices.list({ limit: 100 });
         const invoice = invoices.data.find((i) => i.payment_id === payment.id)!;
         expect(invoice, "the settled charge should have produced an invoice").toBeTruthy();
 
@@ -1336,26 +1492,17 @@ d("BillKit node SDK against a live API", () => {
 
         // Nothing yet: the refund is pending and may still fail, and a
         // gapless series cannot un-issue a number.
-        const before = await client.creditNotes.list<{ data: Array<{ id: string }> }>({
+        const before = await client.creditNotes.list({
           invoice_id: invoice.id,
         });
         expect(before.data).toHaveLength(0);
 
-        // Settle it at the provider, then re-deliver the payment webhook —
+        // Settle it at the provider, then re-deliver the payment webhook:
         // the same order every money spec here uses.
         await mollie.settleRefundsFor(providerPaymentId, "refunded");
         await deliverMollieWebhook(tenant.mollieRouteId, providerPaymentId);
 
-        const notes = await client.creditNotes.list<{
-          data: Array<{
-            id: string;
-            number: string;
-            invoice_id: string;
-            subtotal_cents: number;
-            tax_cents: number;
-            total_cents: number;
-          }>;
-        }>({ invoice_id: invoice.id });
+        const notes = await client.creditNotes.list({ invoice_id: invoice.id });
         expect(notes.data).toHaveLength(1);
         const note = notes.data[0]!;
         expect(note.invoice_id).toBe(invoice.id);
@@ -1380,17 +1527,13 @@ d("BillKit node SDK against a live API", () => {
         const { price } = await makePlan(client, { amountCents: 1900 });
         await checkoutToActive(client, tenant, price.id);
 
-        const subs = await client.subscriptions.list<{
-          data: Array<{ id: string; price_id: string }>;
-        }>({ limit: 100 });
+        const subs = await client.subscriptions.list({ limit: 100 });
         const sub = subs.data.find((s) => s.price_id === price.id)!;
-        const invoices = await client.invoices.list<{
-          data: Array<{ id: string; subscription_id: string | null; status: string }>;
-        }>({ limit: 100 });
+        const invoices = await client.invoices.list({ limit: 100 });
         const invoice = invoices.data.find((i) => i.subscription_id === sub.id)!;
         expect(invoice.status).toBe("paid");
 
-        // Not a limitation — the contract. Voiding claims the sale was never
+        // Not a limitation: the contract. Voiding claims the sale was never
         // owed, which is false once the money moved; the reversal there is a
         // credit note.
         await expect(client.invoices.void(invoice.id)).rejects.toBeInstanceOf(ConflictError);
@@ -1418,7 +1561,7 @@ d("BillKit node SDK against a live API", () => {
           subscription_id: string;
           quantity: number;
           invoice_id: string | null;
-        }>(sub.id, { quantity: 42, metadata: { source: "node-it" }, idempotencyKey: key });
+        }>(sub.id, { quantity: 42, metadata: { source: "node-it" } }, { idempotencyKey: key });
         expect(record.object).toBe("usage_record");
         expect(record.subscription_id).toBe(sub.id);
         expect(record.quantity).toBe(42);
@@ -1427,11 +1570,11 @@ d("BillKit node SDK against a live API", () => {
         // Replaying the same key must return the same record, not
         // double-count the usage: that is what makes at-least-once
         // reporting pipelines safe to retry.
-        const replay = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
-          quantity: 42,
-          metadata: { source: "node-it" },
-          idempotencyKey: key,
-        });
+        const replay = await client.subscriptions.createUsageRecord(
+          sub.id,
+          { quantity: 42, metadata: { source: "node-it" } },
+          { idempotencyKey: key },
+        );
         expect(replay.id).toBe(record.id);
       },
     );
@@ -1466,14 +1609,16 @@ d("BillKit node SDK against a live API", () => {
 
     scenario(
       "usage.non_metered_rejected",
-      "posting usage to a licensed subscription is a typed 400",
+      "posting usage to a licensed subscription is a 409 state_conflict",
       async () => {
         const { price } = await makePlan(client, { amountCents: 2500 });
         const sub = await activeSubscription(client, tenant, price.id);
 
-        await expect(
-          client.subscriptions.createUsageRecord(sub.id, { quantity: 1 }),
-        ).rejects.toBeInstanceOf(InvalidRequestError);
+        const err = await client.subscriptions
+          .createUsageRecord(sub.id, { quantity: 1 })
+          .catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(ConflictError);
+        expect((err as ConflictError).code).toBe("state_conflict");
       },
     );
 
@@ -1485,18 +1630,18 @@ d("BillKit node SDK against a live API", () => {
         const sub = await activeSubscription(client, tenant, price.id);
 
         const identifier = `job-${idemKey()}`;
-        const first = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
-          quantity: 9,
-          identifier,
-          idempotencyKey: idemKey(),
-        });
+        const first = await client.subscriptions.createUsageRecord(
+          sub.id,
+          { quantity: 9, identifier },
+          { idempotencyKey: idemKey() },
+        );
         // A DIFFERENT idempotency key, so the transport-level replay guard
         // cannot be what dedupes this. Only the natural key can.
-        const second = await client.subscriptions.createUsageRecord<{ id: string }>(sub.id, {
-          quantity: 9,
-          identifier,
-          idempotencyKey: idemKey(),
-        });
+        const second = await client.subscriptions.createUsageRecord(
+          sub.id,
+          { quantity: 9, identifier },
+          { idempotencyKey: idemKey() },
+        );
         expect(second.id).toBe(first.id);
 
         const pending = await client.subscriptions.listUsageRecords<{ id: string }>(sub.id, {
@@ -1587,30 +1732,43 @@ d("BillKit node SDK against a live API", () => {
         }),
       ).rejects.toBeInstanceOf(WebhookVerificationError);
     });
+
+    scenario(
+      "webhooks.event_type_constants",
+      "the exported event-type constants equal the live catalogue",
+      async () => {
+        const catalogue = await client.webhookEndpoints.listEventTypes<{
+          data: string[];
+          wildcard: string;
+        }>();
+        const live = catalogue.data.filter((t) => t !== catalogue.wildcard).sort();
+        expect([...EVENT_TYPES].sort()).toEqual(live);
+      },
+    );
   });
 
   // ── methods ───────────────────────────────────────────────────────
   //
   // The two request surfaces take different method sets and this SDK
   // hand-copies both as TypeScript unions. A union that lags the server
-  // is invisible at build time — the `(string & {})` tail keeps it
-  // compiling — so it has to be checked against the running API.
+  // is invisible at build time (the `(string & {})` tail keeps it
+  // compiling), so it has to be checked against the running API.
 
   describe("methods", () => {
     /**
      * The vocabulary a *price* may offer. Mirrors the server's
-     * `RecurringMethod`, which is also what this SDK's checkout `method`
-     * union spells out.
+     * `RecurringMethod`, which is also what this SDK's checkout
+     * `payment_method` union spells out.
      */
     const RECURRING = ["creditcard", "directdebit", "ideal", "eps", "applepay", "paypal"] as const;
     /**
-     * The subset that can actually be a checkout's `method`, i.e. that
+     * The subset that can actually be a checkout's `payment_method`, i.e. that
      * Mollie will mint a mandate from at `sequenceType=first`.
      *
      * `directdebit` is the one member of `RECURRING` missing here, and the
      * distinction is the whole point of this scenario: SEPA belongs in a
      * price's allowlist because it is what the renewals settle on, but it
-     * can never be the FIRST charge — the mandate has to be minted by a
+     * can never be the FIRST charge: the mandate has to be minted by a
      * card, iDEAL, EPS, Apple Pay or PayPal payment before anything can be
      * collected over it.
      */
@@ -1656,7 +1814,7 @@ d("BillKit node SDK against a live API", () => {
           return c.checkoutSessions.create<{ id: string }>({
             customer_id: buyer.id,
             price_id: price.id,
-            method,
+            payment_method: method,
             success_url: "https://merchant.example.com/ok",
             cancel_url: "https://merchant.example.com/cancel",
           });
@@ -1669,8 +1827,8 @@ d("BillKit node SDK against a live API", () => {
 
         // Two different refusals, and they come from two different layers.
         //
-        // `directdebit` passes the request literal — it IS a RecurringMethod,
-        // and the price above offers it — and is refused by the service,
+        // `directdebit` passes the request literal (it IS a RecurringMethod,
+        // and the price above offers it) and is refused by the service,
         // because SEPA is what renewals settle on rather than something a
         // buyer can pay with first.
         //
@@ -1699,14 +1857,15 @@ d("BillKit node SDK against a live API", () => {
 
         for (const method of ONE_SHOT) {
           const buyer = await freshBuyer(c);
-          const charge = await c.oneShotPayments.create<{ id: string }>({
+          const charge = await c.oneShotPayments.create({
             customer_id: buyer.id,
             amount_cents: 2500,
             currency: "EUR",
-            method,
+            payment_method: method,
             success_url: "https://merchant.example.com/ok",
           });
           expect(charge.id, `${method} should take a one-off charge`).toBeTruthy();
+          expect(charge.payment_method).toBe(method);
         }
 
         // directdebit only collects renewals over a mandate another method
@@ -1720,7 +1879,7 @@ d("BillKit node SDK against a live API", () => {
               customer_id: buyer.id,
               amount_cents: 2500,
               currency: "EUR",
-              method,
+              payment_method: method,
               success_url: "https://merchant.example.com/ok",
             })
             .catch((e: unknown) => e);
@@ -1742,7 +1901,7 @@ d("BillKit node SDK against a live API", () => {
             customer_id: buyer.id,
             amount_cents: 2500,
             currency: "EUR",
-            method,
+            payment_method: method,
             success_url: "https://merchant.example.com/ok",
           });
         };

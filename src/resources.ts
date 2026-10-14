@@ -1,838 +1,168 @@
 /**
  * Resource accessors mirroring the BillKit API surface.
  *
- * Each resource exposes the public verbs from `/v1/<resource>`. The
- * return type defaults to `unknown`; the SDK doesn't ship runtime
- * schemas (zod / valibot) because the API is Stripe-shape and tenants
- * typically forward the JSON through their own data layer unchanged.
- * Callers who want strong types parameterise each call with their
- * own generic:
+ * Every method returns the decoded JSON as a plain object, typed from the
+ * public OpenAPI spec (`src/generated/models.ts`). The type parameter on
+ * each method defaults to that type; supplying your own is an unchecked
+ * assertion, there for the rare caller who wants to narrow further.
  *
- *     interface Customer { id: string; email: string }
- *     const c = await client.customers.create<Customer>({ email: "..." });
+ * Signatures follow one rule: path ids first, then the call's parameters,
+ * then {@link RequestOptions} last. Every method has the parameters slot,
+ * including the ones the API takes no parameters for yet ({@link
+ * EmptyParams}), so a parameter added later is an additive change:
  *
- * Every list-returning resource also exposes an `iter()` method that
- * walks every page via the Stripe-shape `has_more` + `starting_after`
- * cursor protocol. Iterate with `for await`:
+ *     await client.customers.create({ email }, { idempotencyKey: "signup-42" });
+ *     await client.subscriptions.cancel(sub.id, {}, { timeout: 5_000 });
  *
- *     for await (const customer of client.customers.iter()) { ... }
- */
-
-import { paginate, type ListResponseEnvelope } from "./pagination.js";
-import type { Transport } from "./transport.js";
-
-// ─── Shared parameter shapes ───────────────────────────────────────
-
-/**
- * Cursor-pagination knobs shared by every `list()` method.
+ * Every list resource also has `iter()`, which takes exactly what `list()`
+ * takes and walks every page:
  *
- * Closed on purpose: there is no index signature, so a misspelled filter
- * (`provisonal`) is a compile error instead of a query parameter the
- * server ignores. The Transport takes `query` as a plain `object` and
- * prunes/stringifies it, which is what lets these interfaces through
- * without a cast.
+ *     for await (const customer of client.customers.iter({ limit: 100 })) { ... }
  */
-export interface BaseListParams {
-  limit?: number;
-  starting_after?: string;
-  // Deliberately no `ending_before`: BillKit's cursor pagination binds
-  // `limit` + `starting_after` only (see `api/billkit/api/pagination.py`).
-  // Advertising a backwards cursor the server ignores is worse than not
-  // having one — the request succeeds and silently re-serves page 1.
-}
 
-/**
- * `?expand=` on a single-object GET. The relations a route accepts differ
- * per resource and are listed on each `retrieve()`; an unknown one is a
- * `400` naming the ones that work.
- */
-export interface ExpandOptions {
-  expand?: string[];
-}
-
-/**
- * `prices.list` params. Adds the server-side `product_id` filter on top of
- * the usual cursor knobs. `GET /v1/prices?product_id=...` narrows to one
- * product's prices, which beats listing everything and filtering client-side
- * once a tenant has more than a page of prices.
- */
-export interface PricesListParams extends BaseListParams {
-  product_id?: string;
-}
-
-/**
- * `payments.list` params. `customer_id` narrows to one customer's
- * charges. Mandate verifications are never listed, so every row is a
- * real purchase attempt; check `status` before treating one as revenue.
- */
-export interface PaymentsListParams extends BaseListParams {
-  customer_id?: string;
-  /** Expandable here: `customer`, `subscription`. */
-  expand?: string[];
-}
-
-/**
- * `oneShotPayments.list` params. `payments.list` lists subscription
- * payments only; one-off charges are listed here, newest first.
- * Failed, expired and still-open charges are included, so check `status`
- * before counting a row as revenue.
- */
-export interface OneShotPaymentsListParams extends BaseListParams {
-  customer_id?: string;
-  /**
-   * One of `open`, `pending`, `authorized`, `paid`, `failed`, `expired`,
-   * `canceled`, `refunded`. Anything else is a `400` on `status`.
-   */
-  status?: string;
-}
-
-/**
- * `invoices.list` params. The three id filters each narrow to one row's
- * worth of invoices: `payment_id` answers "which invoice did this charge
- * produce".
- */
-export interface InvoicesListParams extends BaseListParams {
-  customer_id?: string;
-  subscription_id?: string;
-  payment_id?: string;
-  /** One of `draft`, `open`, `paid`, `void`, `uncollectible`. */
-  status?: string;
-  /** Expandable here: `customer`. */
-  expand?: string[];
-}
-
-/**
- * `disputes.list` params. `status` takes a comma-separated list of `open`
- * / `won`. There is no `lost`, because the provider gives no signal for
- * one. `payment_id` matches subscription payments only, not one-off
- * charges.
- */
-export interface DisputesListParams extends BaseListParams {
-  status?: string;
-  payment_id?: string;
-}
-
-/**
- * `subscriptions.list` params. Both filters take a comma-separated
- * list (`"active,past_due"`); an unrecognised value is rejected with
- * `400 parameter_invalid` rather than silently ignored.
- *
- * The two answer different questions, and mixing them up is the most
- * common mistake against this route. `status` is where the subscription
- * stands with its payments. `renewal_state` is what happens at the end
- * of the current period. A paused subscription keeps `status: "active"`,
- * because the customer has paid for the period they are in, so
- * `renewal_state: "paused"` is the only way to find paused ones —
- * `status: "paused"` is not an accepted value and is rejected.
- */
-export interface SubscriptionsListParams extends BaseListParams {
-  customer_id?: string;
-  /** `incomplete` | `trialing` | `active` | `past_due` | `canceled`, CSV. */
-  status?: string;
-  /** `auto_renew` | `paused` | `canceling` | `stopped`, CSV. */
-  renewal_state?: string;
-  /** Expandable here: `customer`, `price`, `refund_eligibility`. */
-  expand?: string[];
-}
-
-/** Optional idempotency knob carried by every mutating call. */
-export interface IdempotencyOptions {
-  /** Coalesces retries across process restarts. The SDK generates
-   *  a random `sdk-<uuid>` key for every mutating call if you don't
-   *  supply one. Pass your own when you want retries from a different
-   *  process to converge on the same server-side result. */
-  idempotencyKey?: string;
-}
-
-/**
- * @deprecated Alias of {@link BaseListParams}, kept for callers that
- * imported the older name. Reach for the resource-specific `*ListParams`
- * (e.g. `EventsListParams`) instead.
- */
-export type ListParams = BaseListParams;
-
-// ─── Per-resource parameter shapes ─────────────────────────────────
-//
-// We keep one exported interface per public surface so callers can
-// import the shape, build it ahead of time, and pass it in. Inlined
-// shapes were inconsistent across resources; the named-interface
-// form is greppable and survives editor "go to definition".
-
-export interface CreateCustomerParams extends IdempotencyOptions {
-  email?: string;
-  name?: string;
-  country_code?: string;
-  metadata?: Record<string, string>;
-}
-
-export interface UpdateCustomerParams extends IdempotencyOptions {
-  email?: string;
-  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  name?: string | null;
-  country_code?: string;
-  metadata?: Record<string, string>;
-}
-
-/** Query parameters accepted by `GET /v1/customers`. */
-export interface CustomerListParams extends BaseListParams {
-  /**
-   * `false` for customers who have paid, `true` for abandoned checkouts,
-   * omitted for both.
-   */
-  provisional?: boolean;
-  /** Expandable here: `stats`. Sent as `expand=a,b`. */
-  expand?: string[];
-}
-
-/** Query parameters accepted by `GET /v1/products`. */
-export interface ProductsListParams extends BaseListParams {
-  /** Expandable here: `prices`, `stats`, `default_price`. */
-  expand?: string[];
-}
-
-/**
- * Body for `POST /v1/customers/{id}/vat_number`. The VAT number is
- * sent through VIES server-side; the response carries
- * `vat_number_validated` reflecting the outcome.
- *
- * `vat_number: null` **clears** the registration, and is sent as an
- * explicit null rather than pruned: only `undefined` is dropped.
- */
-export interface SetCustomerVatNumberParams extends IdempotencyOptions {
-  vat_number: string | null;
-  /** VIES needs a country; send it when the customer has none yet. */
-  country_code?: string;
-}
-
-/**
- * Body for `POST /v1/customers/{id}/purge`. The server requires
- * `confirmed: true` as a fat-finger guard against accidental purges
- * fired from a DELETE that meant to soft-delete. The SDK defaults
- * `confirmed` to `true` so the caller doesn't have to opt in twice.
- */
-export interface PurgeCustomerParams extends IdempotencyOptions {
-  confirmed?: boolean;
-}
-
-export interface CreateProductParams extends IdempotencyOptions {
-  /** Customer-facing name, for example "Pro" or "Enterprise". */
-  name: string;
-  /** Optional long-form description shown in your own catalog UI. */
-  description?: string;
-  /** Ordered bullets suitable for pricing tables and checkout pages. */
-  marketing_features?: string[];
-  /** Small string metadata map echoed back on the Product object. */
-  metadata?: Record<string, string>;
-  /**
-   * Let a *buyer* type a coupon code at the embedded checkout for this
-   * product. Defaults to `false`. A coupon you apply yourself by passing
-   * `coupon_code` when you create a Checkout Session is unaffected — that
-   * is you discounting your own sale, and it has never needed this flag.
-   *
-   * The code is redeemed only once the payment settles, so a shopper who
-   * tries a single-use code and abandons the checkout does not use it up.
-   */
-  allow_promotion_codes?: boolean;
-}
-
-export interface UpdateProductParams extends IdempotencyOptions {
-  name?: string;
-  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  description?: string | null;
-  /** `null` empties the list. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  marketing_features?: string[] | null;
-  /** Replaces the stored object whole; send `{}` to empty it. */
-  metadata?: Record<string, string>;
-  /** Set false to stop selling a product without deleting history. */
-  active?: boolean;
-  /** See {@link CreateProductParams.allow_promotion_codes}. */
-  allow_promotion_codes?: boolean;
-  /**
-   * The price the billing portal offers on that price's interval. Must be
-   * an active price of this product; anything else is a 400 on
-   * `default_price_id`. An explicit `null` **clears** the default and is
-   * sent as a JSON null rather than pruned (only `undefined` is dropped);
-   * omit the field to leave the default alone.
-   */
-  default_price_id?: string | null;
-}
-
-/**
- * Body for `POST /v1/prices/{id}`. Every field is optional; omitted ones
- * are left alone.
- *
- * The dividing line is what a field decides. `amount_cents`, `currency`,
- * `interval` and `usage_type` decide **what a past charge was**, so they
- * are fixed at creation and absent here, because subscriptions renew
- * against a price by id and editing one would re-price live customers.
- * Everything
- * below decides **what happens next**, which is why it is editable:
- * setting `refund_on_cancel` covers the customers already on the price.
- *
- * `tax_behavior` is the exception and moves one way. It can be set while
- * the price is still `"unspecified"` and never changed again, because
- * flipping it would restate whether tax was inside or on top of an amount
- * somebody has already paid.
- *
- * Only the two refund windows accept `null`, which clears the price's
- * override. The API refuses a `null` on any other field here with a 400.
- */
-export interface UpdatePriceParams extends IdempotencyOptions {
-  /** `false` withdraws the price from sale, `true` puts it back. */
-  active?: boolean;
-  metadata?: Record<string, string>;
-  /** Settable once, while the price is still `"unspecified"`. */
-  tax_behavior?: "inclusive" | "exclusive";
-  /** Read when a checkout opens. At least one entry. */
-  payment_methods?: Array<
-    "creditcard" | "directdebit" | "ideal" | "eps" | "applepay" | "paypal" | (string & {})
-  >;
-  refund_on_cancel?: "none" | "full" | "prorated";
-  /**
-   * `0` disables refunds for that charge type; `N > 0` is an N-day window.
-   * `null` drops the price's override. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone.
-   */
-  refund_window_initial_days?: number | null;
-  /** As {@link UpdatePriceParams.refund_window_initial_days}, for renewals. */
-  refund_window_renewal_days?: number | null;
-}
-
-/**
- * One band of a tiered price.
- *
- * `up_to` is inclusive, and the **last band must be `"inf"`** because a
- * bounded top band cannot price the usage above it. Bands must strictly
- * increase.
- *
- * A band names a unit rate (`unit_amount` in whole minor units, or
- * `unit_amount_decimal` for a finer one), a `flat_amount` charged once for
- * reaching the band, or both. Write a free band as `unit_amount: 0` rather
- * than by omitting the rate, so "free" is something the price says instead
- * of something it forgot.
- */
-export interface PriceTier {
-  up_to: number | "inf";
-  /** Whole minor units per unit in this band. */
-  unit_amount?: number;
-  /**
-   * A rate finer than one minor unit, **as a string** — see
-   * {@link CreatePriceParams.unit_amount_decimal} for why it is never a
-   * `number`.
-   */
-  unit_amount_decimal?: string;
-  /** Charged once when the usage reaches this band. Whole minor units. */
-  flat_amount?: number;
-}
-
-export interface CreatePriceParams extends IdempotencyOptions {
-  /** Existing Product id returned from `client.products.create`. */
-  product_id: string;
-  /**
-   * Whole minor units per period (licensed) or per unit (metered).
-   *
-   * Optional because a metered price can be priced by
-   * {@link CreatePriceParams.unit_amount_decimal} or by
-   * {@link CreatePriceParams.tiers} instead. Exactly one of the three; a
-   * price with none of them is refused server-side.
-   */
-  amount_cents?: number;
-  /**
-   * A per-unit rate smaller than one minor unit, in **minor units**, to 12
-   * decimal places. `"0.02"` is 0.02 cents, i.e. EUR 0.0002 per unit, which
-   * is the canonical per-API-call price and not expressible as an integer.
-   * Metered prices only.
-   *
-   * **It is a `string`, and that is load-bearing.** A JS `number` is an
-   * IEEE-754 double and cannot hold 0.0002 exactly, so the rate would be
-   * corrupted before it was ever multiplied by a quantity. The type forbids
-   * a number at compile time, and the SDK throws a `TypeError` if an
-   * untyped JavaScript caller passes one anyway.
-   *
-   * The period's whole quantity is multiplied by the rate and rounded
-   * **once**, at the invoice.
-   */
-  unit_amount_decimal?: string;
-  /**
-   * `"per_unit"` (the default) multiplies one rate by the quantity.
-   * `"tiered"` prices by bands and requires
-   * {@link CreatePriceParams.tiers} and
-   * {@link CreatePriceParams.tiers_mode}. Metered prices only.
-   */
-  billing_scheme?: "per_unit" | "tiered";
-  /**
-   * How a tier table is read, and there is **no default** because the same
-   * table means two different bills. `"graduated"` prices the units inside
-   * each band; `"volume"` lets the period total pick one band which then
-   * prices every unit. 1,500 units against "first 1,000 at EUR 0.01, then
-   * EUR 0.005" is EUR 12.50 graduated and EUR 7.50 by volume.
-   */
-  tiers_mode?: "graduated" | "volume";
-  /** The band table. Required when `billing_scheme` is `"tiered"`, refused otherwise. */
-  tiers?: PriceTier[];
-  currency: string;
-  interval: "month" | "year" | (string & {});
-  metadata?: Record<string, string>;
-  trial_days?: number;
-  trial_verification_cents?: number;
-  payment_methods?: Array<
-    "creditcard" | "directdebit" | "ideal" | "eps" | "applepay" | "paypal" | (string & {})
-  >;
-  /**
-   * What a cancellation refunds without being asked. `"none"` (the default)
-   * nothing; `"full"` the whole last charge; `"prorated"` the unused part
-   * of the current period. Both non-none modes also end access
-   * immediately, and both stay bounded by the refund window below.
-   *
-   * Metered prices must leave this at `"none"`: ending access mid-period
-   * would strand usage that has not been billed yet.
-   */
-  refund_on_cancel?: "none" | "full" | "prorated";
-  /**
-   * Per-Price refund-window override (`POST /v1/prices`). `undefined`
-   * inherits the default policy table (7d / 30d initial, 3d renewal);
-   * `0` disables refunds for that charge type; `N > 0` is an N-day
-   * window (capped server-side at 365). Useful for "Pro Bundle has a
-   * 14-day money back" or "Lifetime: no refunds" product decisions.
-   */
-  refund_window_initial_days?: number;
-  refund_window_renewal_days?: number;
-  /**
-   * Whether `amount_cents` is quoted gross (`"inclusive"`, VAT is
-   * backed out of it) or net (`"exclusive"`, VAT is added on top at
-   * charge time). `undefined` inherits `"unspecified"`, which defers to
-   * the tax rate configured for the buyer's country. Set it explicitly
-   * when the amount you advertise has to be the amount charged,
-   * regardless of what tax rates exist now or later.
-   */
-  tax_behavior?: "inclusive" | "exclusive" | "unspecified";
-  /**
-   * `"licensed"` (the default when omitted) bills `amount_cents` per
-   * period regardless of consumption. `"metered"` bills **per reported
-   * unit**: post consumption with `subscriptions.createUsageRecord`, and
-   * at each period close BillKit invoices the period's total and charges
-   * the stored mandate.
-   *
-   * A metered unit is priced by `amount_cents`, by `unit_amount_decimal`,
-   * or by `tiers` — exactly one. Metered prices must be
-   * `interval: "month"`, cannot have `trial_days`, and cannot set
-   * `refund_on_cancel`.
-   */
-  usage_type?: "licensed" | "metered";
-}
-
-/**
- * Body for `POST /v1/subscriptions/{id}/usage_records`. Only valid
- * against a subscription whose price is `usage_type: "metered"`; the
- * server rejects a licensed subscription with `400 parameter_invalid`.
- */
-export interface CreateUsageRecordParams extends IdempotencyOptions {
-  /** Units consumed, `1..1_000_000`. Post multiple records to accumulate. */
-  quantity: number;
-  /**
-   * Epoch seconds when the consumption happened. Omit to let the
-   * server stamp receipt time. Useful when reporting is batched and
-   * the record must land in the period the usage occurred.
-   */
-  occurred_at?: number;
-  /**
-   * Your own id for the event being metered, unique within this
-   * subscription. This is the dedupe an `Idempotency-Key` cannot do.
-   *
-   * The key covers a retry of *one HTTP request*, including the SDK's own
-   * internal retries. `identifier` covers a retry of *your* call — a job
-   * runner replaying a task, a queue delivering twice, your code
-   * re-invoking after its own timeout — which arrives at the API as a
-   * genuinely new request with a new key. A second report of the same
-   * identifier returns the first record unchanged instead of billing
-   * twice.
-   *
-   * If your reporting pipeline is at-least-once, this is the one that
-   * matters.
-   */
-  identifier?: string;
-  /** Small string metadata map echoed back on the record. */
-  metadata?: Record<string, string>;
-}
-
-/**
- * `subscriptions.listUsageRecords` params. `invoice_id` filters by
- * billing state: `"pending"` selects records not yet rolled into an
- * invoice, and a concrete `inv_...` id selects the records that
- * invoice billed. Omit it to list everything.
- */
-export interface UsageRecordsListParams extends BaseListParams {
-  invoice_id?: "pending" | (string & {});
-}
-
-export interface CreateCheckoutSessionParams extends IdempotencyOptions {
-  /**
-   * Existing Customer to attach the session to. Mutually exclusive
-   * with `customer_email`; exactly one of the two must be set.
-   */
-  customer_id?: string;
-  /**
-   * Stripe-compatible shortcut: BillKit creates a fresh Customer row
-   * in the same transaction as the checkout. Never dedupes by email
-   * (emails are not unique identifiers in BillKit). Mutually exclusive
-   * with `customer_id`.
-   */
-  customer_email?: string;
-  /**
-   * Optional friendly name carried onto the auto-created Customer when
-   * using `customer_email`. Rejected with `422` if supplied alongside
-   * `customer_id` (rename existing customers via `customers.update`).
-   */
-  customer_name?: string;
-  price_id: string;
-  success_url: string;
-  cancel_url: string;
-  /**
-   * The buyer's ISO-3166-1 alpha-2 country, when you already know it.
-   * Stored on the customer if they do not have one yet, which is what
-   * lets VAT apply to the very first charge. On the hosted flow the buyer
-   * only reaches a country-collecting page after the charge exists.
-   * Never overwrites a country the customer already has.
-   */
-  country?: string;
-  /**
-   * Pin the Mollie payment method. `undefined` lets Mollie pick from
-   * the customer's available methods; when set, must be in the price's
-   * `payment_methods` allowlist.
-   *
-   * Subscription-starting only, so this is deliberately NARROWER than the
-   * one-shot union: `bancontact` and `banktransfer` are absent because
-   * neither can mint the mandate a renewal needs. Mollie refuses the
-   * latter outright with "The payment method does not support sequence
-   * type".
-   */
-  method?:
-    | "creditcard"
-    | "directdebit"
-    | "ideal"
-    | "eps"
-    | "applepay"
-    | "paypal"
-    | (string & {});
-  /** Optional coupon code applied at checkout; atomically claimed. */
-  coupon_code?: string;
-  /**
-   * Per-session trial override. Replaces the price's `trial_days`
-   * for this checkout. Capped server-side at `2 × max(price.trial_days, 14)`.
-   * `0` disables a trial that the price would otherwise grant.
-   */
-  trial_days_override?: number;
-  /**
-   * `"hosted"` (the default) returns a `url` you redirect the buyer to.
-   * `"embedded"` returns a `client_secret` instead, for
-   * `mountCheckoutElement()` / `<CheckoutElement/>` from
-   * `@billkit-eu/js` — the card fields then render in a cross-origin
-   * iframe on your own page.
-   */
-  ui_mode?: "hosted" | "embedded";
-  /**
-   * Small string map carried onto the session. Up to 50 keys, key ≤ 40
-   * chars, value ≤ 500 chars.
-   */
-  metadata?: Record<string, string>;
-}
-
-export interface CreateRefundParams extends IdempotencyOptions {
-  payment_id?: string;
-  subscription_id?: string;
-  /**
-   * Refund a mandate-less one-shot payment (`oneShotPayments.create`).
-   * Mutually exclusive with `payment_id` / `subscription_id`; pass
-   * exactly one target or the server rejects with `400`.
-   */
-  one_shot_payment_id?: string;
-  /**
-   * Partial-refund amount in minor units. Omit to refund the whole remaining
-   * balance (the full charge when nothing has been refunded yet). A payment
-   * may carry several partial refunds up to the charged amount; the one that
-   * brings the cumulative total to the full charge cancels the bound
-   * subscription (or flips a one-shot to `refunded`).
-   */
-  amount_cents?: number;
-  reason?: string;
-}
-
-/**
- * Body for `POST /v1/checkout/one_shot`, a single mandate-less charge
- * (the Stripe PaymentIntent shape, mapped onto Mollie). No subscription,
- * no mandate, no renewals: it settles once against your `success_url`.
- */
-export interface CreateOneShotPaymentParams extends IdempotencyOptions {
-  /** Existing Customer to charge. */
-  customer_id: string;
-  amount_cents: number;
-  /** ISO-4217, e.g. `"EUR"`. Validated against the tenant allowlist. */
-  currency: string;
-  /**
-   * How the payer pays. `"hosted"` (the server default when omitted) needs
-   * `method` and answers with a `redirect_url` on Mollie's hosted page.
-   * `"embedded"` must be sent WITHOUT `method`: no provider payment is
-   * created yet, and the response carries a short-lived `client_secret`
-   * (with a null `redirect_url`) for the browser payment element
-   * (`mountOneShotPaymentElement` in `@billkit-eu/js`), where the payer picks
-   * the method. `method` stays null until they confirm, and `expires_at` is
-   * when the secret and the unconfirmed charge lapse. The secret is on the
-   * create response only; a retrieve reads it back as null. Events, refunds
-   * and the payment id are the same in both modes.
-   */
-  ui_mode?: "hosted" | "embedded";
-  /**
-   * Concrete Mollie method to charge with. Required for a hosted one-shot,
-   * which commits to a method up front, and must be omitted for an embedded
-   * one (the server answers 422 either way round). Validated against the tenant's capability allowlist for
-   * `currency`; one-off methods like `bancontact` and `banktransfer` are
-   * allowed here even though they can't back a subscription.
-   *
-   * `banktransfer` settles in DAYS, not seconds: the payer is handed bank
-   * details and Mollie holds the payment `open` for about a fortnight. Expect
-   * `one_shot_payment.paid` long after the call returns.
-   *
-   * `giropay` was removed: the scheme shut down at the end of 2024 and the
-   * server now 422s it. The `(string & {})` tail keeps this open on
-   * purpose: unlike the console's read-side `PaymentMethodKind`, this is a
-   * *request* type the server validates, so an SDK that lags a newly-added
-   * method should not be the thing that blocks the call.
-   */
-  method?:
-    | "creditcard"
-    | "directdebit"
-    | "ideal"
-    | "bancontact"
-    | "eps"
-    | "applepay"
-    | "paypal"
-    | "banktransfer"
-    | (string & {});
-  /** Where Mollie returns the payer after the hosted checkout. */
-  success_url: string;
-  /** Optional page for an abandoned/cancelled payment. */
-  cancel_url?: string;
-  /** Shown on the Mollie page + the payer's bank statement. */
-  description?: string;
-  /**
-   * Per-payment refund-window override in days. `undefined` inherits the
-   * one-shot default (30 days); `0` disables refunds for this payment;
-   * `N > 0` is an N-day window (capped server-side at 365).
-   */
-  refund_window_days?: number;
-  /**
-   * Whether `amount_cents` is quoted gross or net.
-   *
-   * `"inclusive"` (the default when omitted) charges `amount_cents` and
-   * backs the VAT out of it. `"exclusive"` reads it as a net figure and
-   * charges the payer `amount_cents + tax`, so the response's
-   * `amount_cents` comes back *larger* than the one you sent, because it
-   * is always what was actually charged. Reconcile against `net_cents` /
-   * `tax_cents` on the response.
-   *
-   * Omit to inherit the country default from your configured tax rate.
-   */
-  tax_behavior?: "inclusive" | "exclusive";
-  metadata?: Record<string, string>;
-}
-
-export interface CreateWebhookEndpointParams extends IdempotencyOptions {
-  url: string;
-  enabled_events?: string[];
-  description?: string;
-}
-
-export interface UpdateWebhookEndpointParams extends IdempotencyOptions {
-  url?: string;
-  enabled_events?: string[];
-  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  description?: string | null;
-  status?: string;
-}
-
-export interface EventsListParams extends BaseListParams {
-  /** Server-side filter, e.g. `customer.created`. */
-  type?: string;
-  /** Expandable here: `customer`. `events.retrieve` accepts none. */
-  expand?: string[];
-}
-
-export interface SetPortalBrandingParams extends IdempotencyOptions {
-  business_name?: string;
-  support_email?: string;
-  logo_url?: string;
-  theme?: Record<string, unknown>;
-  capabilities?: Record<string, unknown>;
-}
-
-export interface RotateProviderCredentialParams extends IdempotencyOptions {
-  /** New raw provider API key. Encrypted server-side; never logged. */
-  api_key: string;
-  /** Defaults to the calling key's mode. */
-  mode?: "test" | "live" | (string & {});
-  /** Currently only `"mollie"`. */
-  provider?: "mollie" | (string & {});
-}
-
-export interface CreateCouponParams extends IdempotencyOptions {
-  code: string;
-  /**
-   * `"percent"` reads `discount_value` as whole percent; `"fixed_cents"`
-   * reads it as minor units off the charge. Those are the only two the
-   * API accepts (`schemas/coupon.py`); anything else is a `422`.
-   */
-  discount_type: "percent" | "fixed_cents" | (string & {});
-  discount_value: number;
-  duration: "once" | "repeating" | "forever" | (string & {});
-  duration_in_months?: number;
-  max_redemptions?: number;
-  redeem_by?: number;
-  applies_to_price_ids?: string[];
-  min_amount_cents?: number;
-}
-
-export interface UpdateCouponParams extends IdempotencyOptions {
-  active?: boolean;
-  /** `null` removes the redemption cap. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  max_redemptions?: number | null;
-  /** Epoch seconds. `null` removes the expiry. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  redeem_by?: number | null;
-  /** `null` lifts the price restriction. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  applies_to_price_ids?: string[] | null;
-  /** `null` lifts the minimum. An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  min_amount_cents?: number | null;
-}
-
-export interface ValidateCouponParams {
-  code: string;
-  /**
-   * Scope the dry-run to one price. Optional: omit to validate the code
-   * on its own (existence, active, not exhausted, not expired). Supply it
-   * to also check the coupon's `applies_to_price_ids` restriction.
-   */
-  price_id?: string;
-  /**
-   * Base amount the discount is computed against, in minor units.
-   * Optional: omit to skip the discount math and the `min_amount_cents`
-   * check. `POST /v1/coupons/validate` treats both fields as nullable.
-   */
-  amount_cents?: number;
-}
-
-export interface CreateTaxRateParams extends IdempotencyOptions {
-  country_code: string;
-  rate_basis_points: number;
-  display_name?: string;
-  inclusive?: boolean;
-}
-
-export interface UpdateTaxRateParams extends IdempotencyOptions {
-  rate_basis_points?: number;
-  /** An explicit `null` **clears** it and is sent as a JSON null rather than pruned (only `undefined` is dropped); omit the field to leave it alone. */
-  display_name?: string | null;
-  inclusive?: boolean;
-  active?: boolean;
-}
-
-/**
- * `auditLogs.list` params. All four filters match exactly and combine.
- *
- * `resource_type` narrows to a kind (`"customer"`, `"price"`);
- * `resource_id` narrows to one row, which is the "everything that ever
- * happened to this customer" question an audit log mostly exists for.
- * Pair them or use `resource_id` alone — ids are already unique.
- */
-export interface AuditLogsListParams extends BaseListParams {
-  action?: string;
-  resource_type?: string;
-  resource_id?: string;
-  actor_id?: string;
-}
-
-/**
- * `creditNotes.list` params.
- *
- * `invoice_id` answers "was this sale credited, and by how much", which is
- * the question when reconciling one invoice; `customer_id` answers it for
- * everything credited back to one buyer.
- */
-export interface CreditNotesListParams extends BaseListParams {
-  invoice_id?: string;
-  customer_id?: string;
-}
-
-/**
- * Body for `POST /v1/tenant/billing_profile`: the seller identity that
- * VAT is decided against and that an invoice prints.
- *
- * `country_code` is required on every call: there is nothing to leave
- * alone about a jurisdiction. The address fields and
- * `registration_number` are partial-update: omit one to leave the stored
- * value alone, or pass an explicit `null` to clear it, because moving
- * office is a real event.
- *
- * `vat_id` can be set once. After that, a different value or `null` is
- * refused with a 400 (`param: "vat_id"`, reason `vat_id_locked`) and the
- * call writes nothing; re-sending the stored number is accepted. BillKit
- * invoices you reverse-charged against it, so support changes it.
- */
-export interface SetTenantBillingProfileParams extends IdempotencyOptions {
-  /** ISO-3166-1 alpha-2, e.g. `"NL"`. */
-  country_code: string;
-  /** Your own EU VAT registration. Set once; support changes or clears it. */
-  vat_id?: string | null;
-  address_line1?: string | null;
-  address_line2?: string | null;
-  postal_code?: string | null;
-  city?: string | null;
-  registration_number?: string | null;
-}
-
-/**
- * Body for `POST /v1/api_keys`. The full key is returned **once**, on the
- * create response, and is never retrievable again.
- */
-export interface CreateApiKeyParams extends IdempotencyOptions {
-  /** Human label, so a key can be identified before it is revoked. */
-  label?: string;
-  /**
-   * Narrow what the key may do. Omit to inherit the calling key's own
-   * scopes; a key can never grant more than it holds.
-   */
-  scopes?: string[];
-}
-
-/** `invoices.void` params. `reason` is recorded on the audit row only. */
-export interface VoidInvoiceParams extends IdempotencyOptions {
-  reason?: string;
-}
-
-export interface CreateBillingPortalSessionParams extends IdempotencyOptions {
-  subscription_id: string;
-  return_url: string;
-  /**
-   * Also email the portal link to the subscription's customer, at the
-   * address on their record, as a tenant-branded message. Defaults to
-   * `false`: without it you distribute the returned `url` yourself.
-   */
-  deliver_email?: boolean;
-}
+import type {
+  ApiKey,
+  AuditLog,
+  BillingPortalSession,
+  BillingPortalSessionRevocation,
+  CheckoutSession,
+  Coupon,
+  CouponValidation,
+  CreditNote,
+  Customer,
+  DeletedResource,
+  Dispute,
+  Event,
+  EventTypeList,
+  Invoice,
+  InvoiceEmailResult,
+  ListResponse,
+  OneShotPayment,
+  Payment,
+  PlanChangePreview,
+  Price,
+  Product,
+  ProviderPayload,
+  PurgedResource,
+  Reauthorization,
+  Refund,
+  Subscription,
+  TaxRate,
+  TenantBillingProfile,
+  TenantCapabilities,
+  TenantPortalBranding,
+  TenantProviderCredential,
+  TestClock,
+  UsageRecord,
+  UsageSummary,
+  WebhookDelivery,
+  WebhookEndpoint,
+} from "./generated/models.js";
+import { autoPage } from "./pagination.js";
+import type {
+  AdvanceTestClockParams,
+  AuditLogsListParams,
+  BaseListParams,
+  CreateApiKeyParams,
+  CreateBillingPortalSessionParams,
+  CreateCheckoutSessionParams,
+  CreateCouponParams,
+  CreateCustomerParams,
+  CreateOneShotPaymentParams,
+  CreatePriceParams,
+  CreateProductParams,
+  CreateRefundParams,
+  CreateTaxRateParams,
+  CreateTestClockParams,
+  CreateUsageRecordParams,
+  CreateWebhookEndpointParams,
+  CreditNotesListParams,
+  CustomerListParams,
+  DisputesListParams,
+  EmptyParams,
+  EventsListParams,
+  InvoicesListParams,
+  OneShotPaymentsListParams,
+  PaymentsListParams,
+  PreviewSubscriptionUpdateParams,
+  PricesListParams,
+  ProductsListParams,
+  PurgeCustomerParams,
+  ReauthorizePaymentMethodParams,
+  RetrieveParams,
+  RotateProviderCredentialParams,
+  SetCustomerVatNumberParams,
+  SetPortalBrandingParams,
+  SetTenantBillingProfileParams,
+  SubscriptionsListParams,
+  UpdateCouponParams,
+  UpdateCustomerParams,
+  UpdatePriceParams,
+  UpdateProductParams,
+  UpdateSubscriptionParams,
+  UpdateTaxRateParams,
+  UpdateWebhookEndpointParams,
+  UsageRecordsListParams,
+  ValidateCouponParams,
+  VoidInvoiceParams,
+} from "./params.js";
+import type { RequestOptions, Transport } from "./transport.js";
 
 // ─── Internals ─────────────────────────────────────────────────────
 
 /**
- * Percent-encode a caller-supplied id before it becomes a path segment.
+ * Build a request path from caller-supplied ids, as a tagged template:
+ * `` p`/v1/customers/${id}` ``.
  *
- * Ids reach the SDK from the caller's own storage, and one carrying `/`,
- * `?` or `#` would otherwise rewrite the request: `#` truncates the path,
- * `?` turns the tail into a query string, and `/` walks to a different
- * route entirely. Encoding keeps the request on the route the method
- * names, so a bad id is a clean `404` rather than a call somewhere else.
+ * Each id is percent-encoded before it becomes a path segment. An id
+ * carrying `/`, `?` or `#` would otherwise rewrite the request onto a
+ * different route; encoded, a bad id is a clean `404`. An empty or
+ * whitespace-only id is refused locally, because `/v1/customers/` is a
+ * list, not a lookup that 404s.
+ *
+ * Nothing is checked here. The path is resolved inside the async request
+ * helpers, so a refused id surfaces as a rejected promise rather than a
+ * synchronous throw that `.catch()` never sees.
  */
-function p(id: string): string {
+function p(strings: TemplateStringsArray, ...ids: string[]): ResourcePath {
+  return { strings, ids };
+}
+
+interface ResourcePath {
+  readonly strings: TemplateStringsArray;
+  readonly ids: readonly string[];
+}
+
+type RequestPath = string | ResourcePath;
+
+function resolvePath(path: RequestPath): string {
+  if (typeof path === "string") return path;
+  let out = path.strings[0] ?? "";
+  path.ids.forEach((id, i) => {
+    out += encodeId(id) + (path.strings[i + 1] ?? "");
+  });
+  return out;
+}
+
+function encodeId(id: unknown): string {
+  if (typeof id !== "string" || id.trim() === "") {
+    throw new TypeError(
+      `BillKit: an id is required here, got ${JSON.stringify(id)}. ` +
+        "Pass the object's id (for example `cus_...`).",
+    );
+  }
+  // `.` and `..` survive percent-encoding unchanged, and the URL parser
+  // resolves them as dot segments: `customers.retrieve("..")` would become
+  // `GET /v1/`, a different route rather than a lookup that 404s.
+  if (id === "." || id === "..") {
+    throw new TypeError(
+      `BillKit: ${JSON.stringify(id)} is not an id. Pass the object's id (for example \`cus_...\`).`,
+    );
+  }
   return encodeURIComponent(id);
 }
 
-function dropUndefined<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
+function dropUndefined(obj: object): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v !== undefined) out[k] = v;
@@ -840,28 +170,118 @@ function dropUndefined<T extends Record<string, unknown>>(obj: T): Record<string
   return out;
 }
 
+const REQUEST_OPTION_KEYS = new Set(["idempotencyKey", "signal", "timeout", "maxRetries", "headers"]);
+
 /**
- * Strips the `idempotencyKey` carrier from a mutating-call body and
- * returns `{ body, idempotencyKey }`. Pulled out so the per-resource
- * methods read as "describe the verb" instead of "shuffle keys".
+ * Refuse a key that is not a request option.
+ *
+ * The last argument used to be a parameters object on several methods
+ * (`iter({ pageSize })`, `cancel(id, { idempotencyKey })`), and a value in
+ * the wrong slot is otherwise silently ignored. Failing loudly is the
+ * cheaper outcome for a caller mid-upgrade. That also means a superset
+ * object (your own config with the options spread into it) is refused.
+ *
+ * A key whose value is `undefined` is treated as absent, whatever its name,
+ * so `{ ...defaults, idempotencyKey: undefined }` and an optional field
+ * forwarded from your own options type both work.
  */
-function splitIdempotency<P extends IdempotencyOptions>(
-  params: P,
-): { body: Record<string, unknown>; idempotencyKey: string | undefined } {
-  const { idempotencyKey, ...rest } = params;
-  return { body: dropUndefined(rest as Record<string, unknown>), idempotencyKey };
+function checkOptions(options: RequestOptions | undefined): RequestOptions | undefined {
+  if (options === undefined || options === null) return undefined;
+  if (typeof options !== "object") {
+    throw new TypeError(`BillKit: request options must be an object, got ${typeof options}.`);
+  }
+  for (const [key, value] of Object.entries(options)) {
+    if (value === undefined) continue;
+    if (!REQUEST_OPTION_KEYS.has(key)) {
+      const hint =
+        key === "pageSize"
+          ? " The page size of iter() is now `limit`, in its parameters."
+          : " Request options are idempotencyKey, signal, timeout, maxRetries and headers.";
+      throw new TypeError(`BillKit: "${key}" is not a request option.${hint}`);
+    }
+  }
+  return options;
+}
+
+/**
+ * Refuse a request option inside the parameters. `idempotencyKey` moved to
+ * the options argument in 1.0, and every id-taking method gained a
+ * parameters slot before its options, so `cancel(id, { timeout })` is the
+ * shape a caller mid-upgrade writes. Left alone, the key would reach the
+ * API as a body field or query parameter: a 400 `parameter_unknown` that
+ * names nothing about options, or, on a GET, silently nothing at all.
+ *
+ * `undefined` is pruned from every request anyway, so a spread that
+ * carries `idempotencyKey: undefined` sends nothing wrong and is let through.
+ */
+function checkNotOptions(params: object): void {
+  if ((params as { idempotencyKey?: unknown }).idempotencyKey !== undefined) {
+    throw new TypeError(
+      "BillKit: idempotencyKey belongs in the request options (the last argument), " +
+        "not in the parameters: create(params, { idempotencyKey }).",
+    );
+  }
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && REQUEST_OPTION_KEYS.has(key)) {
+      throw new TypeError(
+        `BillKit: "${key}" is a request option, not a parameter. Request options are the ` +
+          `last argument, after the parameters: retrieve(id, {}, { ${key} }).`,
+      );
+    }
+  }
+}
+
+function checkParamsObject(params: unknown): void {
+  if (params === undefined || params === null) return;
+  if (typeof params !== "object" || Array.isArray(params)) {
+    throw new TypeError(`BillKit: parameters must be an object, got ${typeof params}.`);
+  }
+}
+
+function checkBody(params: object | undefined): Record<string, unknown> | undefined {
+  if (params === undefined || params === null) return undefined;
+  checkNotOptions(params);
+  return dropUndefined(params);
+}
+
+function checkQuery(query: object | undefined): object | undefined {
+  if (query === undefined || query === null) return undefined;
+  checkNotOptions(query);
+  return query;
+}
+
+/**
+ * Validate the parameters of a call the API takes none for yet, and send
+ * nothing. The slot exists so a parameter the API adds later arrives as an
+ * optional field rather than a new argument that shifts the options along.
+ *
+ * Any key with a value is refused: the type already forbids one, and a key
+ * that reached here anyway (plain JavaScript, an `as` cast) would otherwise
+ * be dropped without a word. A request option in this slot gets a hint,
+ * because `cancel(id, { timeout })` was the 0.x shape.
+ */
+function checkEmpty(params: unknown): undefined {
+  checkParamsObject(params);
+  if (params === undefined || params === null) return undefined;
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined) continue;
+    const hint = REQUEST_OPTION_KEYS.has(key)
+      ? ` "${key}" is a request option, and request options are the last argument: ` +
+        `pass {} as the parameters, then { ${key} }.`
+      : "";
+    throw new TypeError(`BillKit: this call takes no parameters, so "${key}" cannot be sent.${hint}`);
+  }
+  return undefined;
 }
 
 /**
  * Refuse a sub-minor-unit rate that arrived as a `number`.
  *
  * The type already forbids it, so this exists for the callers the type
- * system cannot reach: plain JavaScript, a value that came through `any`,
- * a body parsed from JSON. A double cannot hold 0.0002 exactly, so
- * accepting one would work for the rates that happen to round-trip and
- * silently mis-price the ones that do not — the worst of the three
- * available behaviours, and the reason the field is a string in the first
- * place.
+ * system cannot reach: plain JavaScript, a value through `any`, a body
+ * parsed from JSON. A double cannot hold 0.0002 exactly, so accepting one
+ * would work for the rates that happen to round-trip and silently
+ * mis-price the ones that do not.
  */
 function assertDecimalRateIsString(value: unknown, field: string): void {
   if (value === undefined || value === null || typeof value === "string") return;
@@ -872,14 +292,13 @@ function assertDecimalRateIsString(value: unknown, field: string): void {
   );
 }
 
-/** Same check at the price level and inside every band of a tier table. */
 function assertPriceRatesAreStrings(params: CreatePriceParams): CreatePriceParams {
   assertDecimalRateIsString(params.unit_amount_decimal, "unit_amount_decimal");
   // Inside a tier is where a rate is most likely to be typed as a bare
-  // literal, so the guard has to reach in there too.
+  // literal, so the guard reaches in there too.
   (params.tiers ?? []).forEach((tier, index) => {
     assertDecimalRateIsString(
-      (tier as PriceTier | undefined)?.unit_amount_decimal,
+      (tier as { unit_amount_decimal?: unknown } | undefined)?.unit_amount_decimal,
       `tiers[${index}].unit_amount_decimal`,
     );
   });
@@ -887,77 +306,128 @@ function assertPriceRatesAreStrings(params: CreatePriceParams): CreatePriceParam
 }
 
 /**
- * Shared transport wrapper. Resources subclass this so each method
- * reads as a single line, "verb to path with params", instead of
- * the four-line `this.t.request({ ... })` boilerplate the previous
- * draft repeated everywhere.
+ * Shared request helpers. Every helper is `async` and resolves its path
+ * and checks its arguments inside the body, so anything refused becomes a
+ * rejection rather than a throw out of a method typed `Promise<T>`.
  */
 abstract class BaseResource {
   constructor(protected readonly t: Transport) {}
 
+  protected async get<T>(path: RequestPath, query?: object, options?: RequestOptions): Promise<T> {
+    return this.t.request<T>({
+      method: "GET",
+      path: resolvePath(path),
+      query: checkQuery(query),
+      options: checkOptions(options),
+    });
+  }
+
+  /** A GET whose route takes no parameters yet; see {@link checkEmpty}. */
+  protected async getNone<T>(path: RequestPath, params: unknown, options?: RequestOptions): Promise<T> {
+    return this.get<T>(path, checkEmpty(params), options);
+  }
+
+  protected async getBinary(
+    path: RequestPath,
+    params: unknown,
+    options?: RequestOptions,
+  ): Promise<ArrayBuffer> {
+    checkEmpty(params);
+    return this.t.request<ArrayBuffer>({
+      method: "GET",
+      path: resolvePath(path),
+      options: checkOptions(options),
+      responseType: "binary",
+    });
+  }
+
+  protected async getStream(
+    path: RequestPath,
+    params: unknown,
+    options?: RequestOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    checkEmpty(params);
+    return this.t.request<ReadableStream<Uint8Array>>({
+      method: "GET",
+      path: resolvePath(path),
+      options: checkOptions(options),
+      responseType: "stream",
+    });
+  }
+
+  protected async post<T>(path: RequestPath, params?: object, options?: RequestOptions): Promise<T> {
+    checkParamsObject(params);
+    return this.t.request<T>({
+      method: "POST",
+      path: resolvePath(path),
+      body: checkBody(params),
+      options: checkOptions(options),
+    });
+  }
+
   /**
-   * `query` is a plain object rather than an index-signature type: TypeScript
-   * only gives an implicit index signature to type *aliases*, so a closed
-   * `*ListParams` interface would otherwise need a cast at every call site.
-   * The transport prunes `undefined`/`null` and joins arrays with commas.
+   * A POST whose route takes no body yet (the lifecycle verbs). Sends no
+   * body at all, as before the parameters slot existed.
    */
-  protected get<T>(path: string, query?: object): Promise<T> {
-    return this.t.request<T>({ method: "GET", path, query });
+  protected async postNone<T>(path: RequestPath, params: unknown, options?: RequestOptions): Promise<T> {
+    return this.post<T>(path, checkEmpty(params), options);
   }
 
-  protected post<T, P extends IdempotencyOptions>(path: string, params: P): Promise<T> {
-    const { body, idempotencyKey } = splitIdempotency(params);
-    return this.t.request<T>({ method: "POST", path, body, idempotencyKey });
-  }
-
-  /** POST with no body, used by lifecycle verbs (cancel, resume, revoke ...). */
-  protected postEmpty<T>(path: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.t.request<T>({
-      method: "POST",
-      path,
-      idempotencyKey: params.idempotencyKey,
-    });
-  }
-
-  /** POST with a fixed body and no idempotency stripping (used by
-   *  endpoints whose body is fully specified by the caller's args
-   *  and not optional, e.g. `preview_update`). */
-  protected postFixed<T>(
-    path: string,
-    body: Record<string, unknown>,
-    params: IdempotencyOptions = {},
-  ): Promise<T> {
-    return this.t.request<T>({
-      method: "POST",
-      path,
-      body,
-      idempotencyKey: params.idempotencyKey,
-    });
-  }
-
-  protected del<T>(path: string, params: IdempotencyOptions = {}): Promise<T> {
+  protected async del<T>(path: RequestPath, params: unknown, options?: RequestOptions): Promise<T> {
+    checkEmpty(params);
     return this.t.request<T>({
       method: "DELETE",
-      path,
-      idempotencyKey: params.idempotencyKey,
+      path: resolvePath(path),
+      options: checkOptions(options),
     });
+  }
+
+  /**
+   * `iter()` for any list route: the same parameters as `list()`, with
+   * `limit` as the page size. Options apply to every page request.
+   */
+  protected async *iterate<T, P extends BaseListParams>(
+    path: RequestPath,
+    params: P,
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    if (
+      params !== null &&
+      typeof params === "object" &&
+      (params as { pageSize?: unknown }).pageSize !== undefined
+    ) {
+      throw new TypeError(
+        "BillKit: iter() takes the same parameters as list(), so its page size is `limit`; " +
+          "`pageSize` was renamed in 1.0.",
+      );
+    }
+    checkOptions(options);
+    yield* autoPage<T, P>((page) => this.get<ListResponse<T>>(path, page, options), params);
   }
 }
 
 // ─── Resources ─────────────────────────────────────────────────────
 
 export class Customers extends BaseResource {
-  /** Create a tenant-scoped buyer record. */
-  create<T = unknown>(params: CreateCustomerParams = {}): Promise<T> {
-    return this.post<T, CreateCustomerParams>("/v1/customers", params);
+  /** Create a buyer record. */
+  create<T = Customer>(params: CreateCustomerParams = {}, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/customers", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/customers/${p(id)}`);
+  retrieve<T = Customer>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/customers/${id}`, params, options);
   }
 
-  update<T = unknown>(id: string, params: UpdateCustomerParams = {}): Promise<T> {
-    return this.post<T, UpdateCustomerParams>(`/v1/customers/${p(id)}`, params);
+  update<T = Customer>(
+    id: string,
+    params: UpdateCustomerParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(p`/v1/customers/${id}`, params, options);
   }
 
   /**
@@ -965,991 +435,1060 @@ export class Customers extends BaseResource {
    * true }`, not the customer.
    *
    * The customer leaves the API: `retrieve()` 404s and they drop out of
-   * `list()`. Their payments, invoices and refunds are untouched, and so
-   * is their personal data — use {@link Customers.purge} for a GDPR
-   * erasure. Refused while they hold a subscription that can still
-   * charge them.
+   * `list()`. Their payments, invoices and refunds are untouched, and so is
+   * their personal data; use {@link Customers.purge} for an erasure.
+   * Refused while they hold a subscription that can still charge them.
    */
-  delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/customers/${p(id)}`, params);
+  delete<T = DeletedResource<"customer">>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.del<T>(p`/v1/customers/${id}`, params, options);
   }
 
   /**
-   * List customers, newest first.
+   * List customers, newest first. `provisional: false` returns customers
+   * who paid, `true` abandoned checkouts (a checkout that captures an email
+   * commits its customer before the charge), omitted both.
+   */
+  list<T = Customer>(
+    params: CustomerListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/customers", params, options);
+  }
+
+  /** Every page of `list()`, row by row. */
+  iter<T = Customer>(
+    params: CustomerListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, CustomerListParams>("/v1/customers", params, options);
+  }
+
+  /**
+   * Attach, replace or (with `vat_number: null`) clear the customer's VAT
+   * number. The response's `vat_number_validated` reports whether VIES
+   * confirmed it.
+   */
+  setVatNumber<T = Customer>(
+    id: string,
+    params: SetCustomerVatNumberParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(p`/v1/customers/${id}/vat_number`, params, options);
+  }
+
+  /**
+   * Erase a customer's personal data (GDPR Article 17). Irreversible:
+   * name, VAT number and metadata are cleared, the email is replaced with a
+   * `redacted+<uuid>@invalid` placeholder, and the event log and the stored
+   * provider payloads are redacted.
    *
-   * `provisional` filters on whether the customer ever completed a
-   * payment. A checkout that captures an email commits its Customer
-   * before the charge, so a checkout nobody finished leaves a row behind:
-   * pass `false` for real customers only, `true` for the abandoned ones
-   * (the cart-recovery worklist), or omit for both. Abandoned rows are
-   * swept after the tenant's retention window.
-   */
-  list<T = unknown>(params: CustomerListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/customers", params);
-  }
-
-  /** Walk every page of `list()` and yield each customer. */
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/customers", page), { pageSize: options.pageSize });
-  }
-
-  /**
-   * Attach or replace the customer's VAT number; triggers server-side
-   * VIES validation. The response carries `vat_number_validated`
-   * reflecting whether VIES confirmed the number.
-   */
-  setVatNumber<T = unknown>(id: string, params: SetCustomerVatNumberParams): Promise<T> {
-    return this.post<T, SetCustomerVatNumberParams>(`/v1/customers/${p(id)}/vat_number`, params);
-  }
-
-  /**
-   * Hard-purge a customer's PII for GDPR erasure. Distinct from
-   * `delete()` (soft delete): purge nulls email/name/country/VAT/
-   * metadata, sets `purged_at`, and is irreversible.
+   * Resolves to the same marker `delete()` does, plus `purged: true`
+   * (`{ id, object: "customer", deleted: true, purged: true }`), not the
+   * customer: a purged customer 404s afterwards exactly like a deleted one.
    *
-   * The server requires `confirmed: true` as a fat-finger guard; the
-   * SDK defaults it to `true` so callers don't have to opt in twice.
+   * `{ confirmed: true }` is required. Without it the call is refused here,
+   * before any request is sent:
+   *
+   *     await client.customers.purge(customer.id, { confirmed: true });
    */
-  purge<T = unknown>(id: string, params: PurgeCustomerParams = {}): Promise<T> {
-    const { confirmed = true, idempotencyKey } = params;
-    return this.postFixed<T>(`/v1/customers/${p(id)}/purge`, { confirmed }, { idempotencyKey });
+  async purge<T = PurgedResource<"customer">>(
+    id: string,
+    params: PurgeCustomerParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    if ((params as { confirmed?: unknown } | undefined)?.confirmed !== true) {
+      throw new TypeError(
+        "BillKit: customers.purge erases personal data and cannot be undone. " +
+          "Pass { confirmed: true } as the second argument to confirm it; nothing was sent.",
+      );
+    }
+    return this.post<T>(p`/v1/customers/${id}/purge`, { confirmed: true }, options);
   }
 }
 
 export class Products extends BaseResource {
-  /** Create a catalog Product, then attach one or more Prices to it. */
-  create<T = unknown>(params: CreateProductParams): Promise<T> {
-    return this.post<T, CreateProductParams>("/v1/products", params);
+  /** Create a catalogue product, then attach prices to it. */
+  create<T = Product>(params: CreateProductParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/products", params, options);
   }
 
   /**
    * Expandable: `prices` (every price on the product), `stats`, and
    * `default_price` (the price `default_price_id` names).
    */
-  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
-    return this.get<T>(`/v1/products/${p(id)}`, options);
+  retrieve<T = Product>(
+    id: string,
+    params: RetrieveParams<"prices" | "stats" | "default_price"> = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.get<T>(p`/v1/products/${id}`, params, options);
   }
 
   /**
-   * Patch mutable Product fields, or archive it with `active: false`.
-   *
-   * Archiving is how you stop offering something. The product keeps its
-   * id and still comes back from `retrieve()` and `list()`, because what
-   * was sold under it has to stay readable, so there is no `delete()`.
-   * A checkout against any of its prices is refused from then on, and
-   * `active: true` un-archives.
+   * Change a product, or archive it with `active: false`. An archived
+   * product keeps its id and stays readable, because what was sold under it
+   * has to; checkouts against its prices are refused. `active: true`
+   * un-archives.
    */
-  update<T = unknown>(id: string, params: UpdateProductParams): Promise<T> {
-    return this.post<T, UpdateProductParams>(`/v1/products/${p(id)}`, params);
+  update<T = Product>(id: string, params: UpdateProductParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>(p`/v1/products/${id}`, params, options);
   }
 
-  list<T = unknown>(params: ProductsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/products", params);
+  list<T = Product>(
+    params: ProductsListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/products", params, options);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/products", page), { pageSize: options.pageSize });
+  iter<T = Product>(
+    params: ProductsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, ProductsListParams>("/v1/products", params, options);
   }
 }
 
 export class Prices extends BaseResource {
   /**
-   * Create immutable billing terms for an existing Product.
+   * Create billing terms for a product.
    *
    * A licensed price sends `amount_cents`. A metered price sends one of
-   * `amount_cents`, `unit_amount_decimal` (a rate finer than one minor
-   * unit, as a string) or `billing_scheme: "tiered"` with `tiers` and
-   * `tiers_mode`. Throws `TypeError` before any HTTP call if a decimal
-   * rate arrives as a number — see
-   * {@link CreatePriceParams.unit_amount_decimal}.
+   * `amount_cents`, `unit_amount_decimal` (as a string) or
+   * `billing_scheme: "tiered"` with `tiers` and `tiers_mode`. Rejects with
+   * a `TypeError` before any request if a decimal rate arrives as a number.
    */
-  // `async` on purpose. The rate guard throws, and a synchronous throw out
-  // of a method typed `Promise<T>` escapes `.catch()` entirely — the caller
-  // would have to wrap the call site in try/catch as well, which nobody
-  // does for a promise-returning API. Marking it async turns the throw into
-  // a rejection, so one error path handles both.
-  async create<T = unknown>(params: CreatePriceParams): Promise<T> {
-    return this.post<T, CreatePriceParams>("/v1/prices", assertPriceRatesAreStrings(params));
+  async create<T = Price>(params: CreatePriceParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/prices", assertPriceRatesAreStrings(params), options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/prices/${p(id)}`);
+  retrieve<T = Price>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/prices/${id}`, params, options);
   }
 
   /**
-   * Archive a Price so it stops selling, or put it back on sale.
-   *
-   * `update(id, { active: false })` archives. The price keeps its id and
-   * is still returned by `retrieve()` and by `list()`, because
-   * subscriptions renew against it by id and what they are charged has to
-   * stay readable. Subscriptions already on it keep renewing at it. What
-   * stops is new business: a checkout session against the price is
-   * refused and it is no longer offered as a plan change.
-   *
-   * `{ active: true }` undoes that. `active` is the only field because
-   * `amount_cents`, `currency` and `interval` are fixed at creation, and
-   * since none of them move here neither direction can change what a past
-   * charge was made under. To charge something different, create a new
-   * price.
-   *
-   * Sending the value a price already has returns it unchanged and emits
-   * no second event, so a retry is safe. Archiving emits
-   * `price.archived`; putting one back emits `price.updated`.
+   * Archive a price with `active: false`, put it back with `active: true`,
+   * or change what applies from now on. An archived price stays readable
+   * and keeps renewing its existing subscriptions; new checkouts against it
+   * are refused. Re-sending the current value is a no-op with no event.
    */
-  update<T = unknown>(id: string, params: UpdatePriceParams): Promise<T> {
-    return this.post<T, UpdatePriceParams>(`/v1/prices/${p(id)}`, params);
+  update<T = Price>(id: string, params: UpdatePriceParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>(p`/v1/prices/${id}`, params, options);
   }
 
-  list<T = unknown>(params: PricesListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/prices", params);
+  list<T = Price>(params: PricesListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/prices", params, options);
   }
 
-  iter<T = unknown>(
-    options: { pageSize?: number; product_id?: string } = {},
-  ): AsyncIterableIterator<T> {
-    const filter = options.product_id === undefined ? {} : { product_id: options.product_id };
-    return paginate<T>((page) => this.get("/v1/prices", { ...filter, ...page }), {
-      pageSize: options.pageSize,
-    });
+  iter<T = Price>(
+    params: PricesListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, PricesListParams>("/v1/prices", params, options);
   }
 }
 
 export class CheckoutSessions extends BaseResource {
-  create<T = unknown>(params: CreateCheckoutSessionParams): Promise<T> {
-    return this.post<T, CreateCheckoutSessionParams>("/v1/checkout/sessions", params);
+  /**
+   * Start a checkout. Hosted (the default) returns a `url`; `ui_mode:
+   * "embedded"` returns a `client_secret` for `@billkit-eu/js` instead.
+   */
+  create<T = CheckoutSession>(
+    params: CreateCheckoutSessionParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/checkout/sessions", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/checkout/sessions/${p(id)}`);
+  retrieve<T = CheckoutSession>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/checkout/sessions/${id}`, params, options);
   }
 }
 
 /**
- * Mandate-less one-shot payments (`/v1/checkout/one_shot`).
- *
- * A one-shot is the Stripe PaymentIntent shape mapped onto Mollie: a
- * single `sequenceType=oneoff` charge that provisions nothing: no
- * subscription, no mandate, no renewals. Drive terminal state via the
- * `one_shot_payment.succeeded` / `.failed` webhook events; refund one
- * with `client.refunds.create({ one_shot_payment_id })`.
+ * Mandate-less one-off payments: a single charge that provisions no
+ * subscription and no mandate. Drive terminal state from the
+ * `one_shot_payment.succeeded` / `.failed` events; refund one with
+ * `refunds.create({ one_shot_payment_id })`.
  */
 export class OneShotPayments extends BaseResource {
   /**
-   * Create a one-off charge. Hosted (the default) returns the object with a
-   * `redirect_url`; `ui_mode: "embedded"` returns it with a `client_secret`
-   * for the browser payment element instead.
+   * Create a one-off charge. Hosted (the default) returns a `redirect_url`;
+   * `ui_mode: "embedded"` returns a `client_secret` for the browser
+   * element. The secret is on the create response only.
    */
-  create<T = unknown>(params: CreateOneShotPaymentParams): Promise<T> {
-    return this.post<T, CreateOneShotPaymentParams>("/v1/checkout/one_shot", params);
+  create<T = OneShotPayment>(
+    params: CreateOneShotPaymentParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/checkout/one_shot", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/checkout/one_shot/${p(id)}`);
+  retrieve<T = OneShotPayment>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/checkout/one_shot/${id}`, params, options);
   }
 
-  /** List one-off charges, newest first. Filter by `customer_id` and `status`. */
-  list<T = unknown>(params: OneShotPaymentsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/checkout/one_shot", params);
+  /** One-off charges, newest first. */
+  list<T = OneShotPayment>(
+    params: OneShotPaymentsListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/checkout/one_shot", params, options);
   }
 
-  iter<T = unknown>(
-    options: { pageSize?: number; customer_id?: string; status?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/checkout/one_shot", page), {
-      pageSize: options.pageSize,
-      filters: { customer_id: options.customer_id, status: options.status },
-    });
+  iter<T = OneShotPayment>(
+    params: OneShotPaymentsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, OneShotPaymentsListParams>("/v1/checkout/one_shot", params, options);
   }
 }
 
 export class Subscriptions extends BaseResource {
   /** Expandable: `customer`, `price`, `refund_eligibility`. */
-  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
-    return this.get<T>(`/v1/subscriptions/${p(id)}`, options);
-  }
-
-  /**
-   * List subscriptions, newest first, optionally filtered.
-   *
-   * Reach for `renewal_state: "paused"` rather than `status: "paused"`
-   * to find paused subscriptions; see `SubscriptionsListParams`.
-   */
-  list<T = unknown>(params: SubscriptionsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/subscriptions", params);
-  }
-
-  /**
-   * Walk every page of `list()`. Filters are carried onto each page
-   * request, so a filtered walk narrows server-side instead of paging
-   * the whole history and discarding rows client-side.
-   */
-  iter<T = unknown>(
-    options: {
-      pageSize?: number;
-      customer_id?: string;
-      status?: string;
-      renewal_state?: string;
-    } = {},
-  ): AsyncIterableIterator<T> {
-    // `undefined` query values are pruned by the transport, so the
-    // filter can be spread as-is without a conditional per key.
-    const { pageSize, ...filter } = options;
-    return paginate<T>((page) => this.get("/v1/subscriptions", { ...filter, ...page }), { pageSize });
-  }
-
-  cancel<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/cancel`, params);
-  }
-
-  pause<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/pause`, params);
-  }
-
-  resume<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/resume`, params);
-  }
-
-  /**
-   * Reactivate a canceled-but-still-in-period subscription.
-   *
-   * Distinct from `resume()` (paused → active): `reactivate()` flips
-   * `canceled` back to `active` for the remainder of the current
-   * period, so the customer keeps service without a new checkout.
-   * Returns `409` if the period has already elapsed.
-   */
-  reactivate<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/subscriptions/${p(id)}/reactivate`, params);
-  }
-
-  previewUpdate<T = unknown>(id: string, params: { target_price_id: string }): Promise<T> {
-    return this.postFixed<T>(`/v1/subscriptions/${p(id)}/preview_update`, {
-      target_price_id: params.target_price_id,
-    });
-  }
-
-  update<T = unknown>(
+  retrieve<T = Subscription>(
     id: string,
-    params: { target_price_id: string } & IdempotencyOptions,
+    params: RetrieveParams<"customer" | "price" | "refund_eligibility"> = {},
+    options?: RequestOptions,
   ): Promise<T> {
-    return this.postFixed<T>(
-      `/v1/subscriptions/${p(id)}/update`,
+    return this.get<T>(p`/v1/subscriptions/${id}`, params, options);
+  }
+
+  /**
+   * Subscriptions, newest first. Find paused ones with `renewal_state:
+   * "paused"`, not `status`; see {@link SubscriptionsListParams}.
+   */
+  list<T = Subscription>(
+    params: SubscriptionsListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/subscriptions", params, options);
+  }
+
+  iter<T = Subscription>(
+    params: SubscriptionsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, SubscriptionsListParams>("/v1/subscriptions", params, options);
+  }
+
+  /**
+   * Cancel at the end of the current period.
+   *
+   * While a renewal payment is still settling, this, `pause()` and
+   * `update()` reject with a `ConflictError` (`409 operation_pending`,
+   * `reason: "renewal_processing"`) whose message names when to retry.
+   */
+  cancel<T = Subscription>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/subscriptions/${id}/cancel`, params, options);
+  }
+
+  /** Stop renewing at period end. Sets `renewal_state: "paused"`; `status` stays. */
+  pause<T = Subscription>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/subscriptions/${id}/pause`, params, options);
+  }
+
+  resume<T = Subscription>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/subscriptions/${id}/resume`, params, options);
+  }
+
+  /**
+   * Undo a cancellation while the paid period is still running. Distinct
+   * from `resume()`, which undoes a pause. A `409` once the period is over.
+   */
+  reactivate<T = Subscription>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/subscriptions/${id}/reactivate`, params, options);
+  }
+
+  /** The money a plan change would move, without moving it. */
+  previewUpdate<T = PlanChangePreview>(
+    id: string,
+    params: PreviewSubscriptionUpdateParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(
+      p`/v1/subscriptions/${id}/preview_update`,
       { target_price_id: params.target_price_id },
-      { idempotencyKey: params.idempotencyKey },
+      options,
     );
   }
 
-  reauthorizePaymentMethod<T = unknown>(
+  /** Change the subscription's price. */
+  update<T = Subscription>(
     id: string,
-    params: { return_url: string } & IdempotencyOptions,
+    params: UpdateSubscriptionParams,
+    options?: RequestOptions,
   ): Promise<T> {
-    return this.postFixed<T>(
-      `/v1/subscriptions/${p(id)}/reauthorize_payment_method`,
+    return this.post<T>(
+      p`/v1/subscriptions/${id}/update`,
+      { target_price_id: params.target_price_id },
+      options,
+    );
+  }
+
+  /** Start replacing the payment method; returns where to send the customer. */
+  reauthorizePaymentMethod<T = Reauthorization>(
+    id: string,
+    params: ReauthorizePaymentMethodParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(
+      p`/v1/subscriptions/${id}/reauthorize_payment_method`,
       { return_url: params.return_url },
-      { idempotencyKey: params.idempotencyKey },
+      options,
     );
   }
 
   /**
-   * Report consumption against a metered subscription.
-   *
-   * Only valid when the subscription's price is `usage_type:
-   * "metered"`; a licensed subscription is rejected with `400
-   * parameter_invalid`. Records accumulate until the next period close
-   * rolls them into one invoice line; the record's `invoice_id` stays
-   * `null` until then. Records are immutable once written — they are the
-   * audit trail behind that line — so there is no update or delete.
-   *
-   * Two dedupe mechanisms, covering different failures. The
-   * `Idempotency-Key` the SDK sends covers a retry of this HTTP request,
-   * including its own internal retries. `params.identifier` covers a
-   * retry of *your* call, which arrives as a new request with a new key.
-   * See {@link CreateUsageRecordParams.identifier}.
+   * Report consumption against a metered subscription. A licensed one is
+   * refused with `400 parameter_invalid`. Records are immutable once
+   * written. See {@link CreateUsageRecordParams.identifier} for the dedupe
+   * an idempotency key cannot do.
    */
-  createUsageRecord<T = unknown>(id: string, params: CreateUsageRecordParams): Promise<T> {
-    return this.post<T, CreateUsageRecordParams>(`/v1/subscriptions/${p(id)}/usage_records`, params);
+  createUsageRecord<T = UsageRecord>(
+    id: string,
+    params: CreateUsageRecordParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(p`/v1/subscriptions/${id}/usage_records`, params, options);
   }
 
   /**
-   * List usage records for one subscription.
-   *
-   * Pass `invoice_id: "pending"` to reconcile what has been reported
-   * but not yet billed, or a concrete invoice id to see what that
-   * invoice charged for.
+   * Usage records for one subscription. `invoice_id: "pending"` is what has
+   * been reported and not yet billed.
    */
-  listUsageRecords<T = unknown>(
+  listUsageRecords<T = UsageRecord>(
     id: string,
     params: UsageRecordsListParams = {},
-  ): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>(`/v1/subscriptions/${p(id)}/usage_records`, params);
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>(p`/v1/subscriptions/${id}/usage_records`, params, options);
   }
 
-  /** Walk every page of `listUsageRecords()` for one subscription. */
-  iterUsageRecords<T = unknown>(
+  iterUsageRecords<T = UsageRecord>(
     id: string,
-    options: { pageSize?: number; invoice_id?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get(`/v1/subscriptions/${p(id)}/usage_records`, page), {
-      pageSize: options.pageSize,
-      filters: { invoice_id: options.invoice_id },
-    });
+    params: UsageRecordsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, UsageRecordsListParams>(
+      p`/v1/subscriptions/${id}/usage_records`,
+      params,
+      options,
+    );
   }
 
   /**
-   * Price the pending usage, before the period close bills it.
-   *
-   * `listUsageRecords({ invoice_id: "pending" })` gives the quantity; this
-   * gives the money. `net_cents` / `tax_cents` / `gross_cents` are
-   * computed through the same rate or tier table and the same VAT
-   * resolution the close itself uses, so it is a forecast of the real
-   * invoice rather than an estimate.
-   *
-   * **Read `will_charge` before promising a customer an amount.** A period
-   * whose total is under `minimum_charge_cents` (EUR 1.00) is not charged,
-   * because the payment provider would refuse it. The usage is not lost:
-   * it stays pending and rolls into the next period, which is then billed
-   * for both.
-   *
-   * `open_invoice_id` names an earlier cycle that is invoiced and still
-   * unsettled; while one is open, this period cannot be charged.
+   * Price the pending usage before the period close bills it, through the
+   * same rate table and VAT resolution the close uses. **Read
+   * `will_charge`** before promising an amount: a period under
+   * `minimum_charge_cents` is not charged and rolls into the next one.
    */
-  retrieveUsageSummary<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/subscriptions/${p(id)}/usage_summary`);
+  retrieveUsageSummary<T = UsageSummary>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/subscriptions/${id}/usage_summary`, params, options);
   }
 }
 
 export class Refunds extends BaseResource {
-  create<T = unknown>(params: CreateRefundParams): Promise<T> {
-    return this.post<T, CreateRefundParams>("/v1/refunds", params);
+  /**
+   * Refund a payment, a subscription's last charge, or a one-shot. Settles
+   * asynchronously: watch `refund.succeeded` and `refund.failed`.
+   */
+  create<T = Refund>(params: CreateRefundParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/refunds", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/refunds/${p(id)}`);
+  retrieve<T = Refund>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/refunds/${id}`, params, options);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/refunds", params);
+  list<T = Refund>(params: BaseListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/refunds", params, options);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/refunds", page), { pageSize: options.pageSize });
+  iter<T = Refund>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/refunds", params, options);
   }
 }
 
 /**
- * Chargebacks / disputes (`/v1/disputes`).
- *
- * Read-only. Disputes are provider-originated (opened by the cardholder's
- * bank) and surfaced via the `dispute.created` / `dispute.closed` webhook
- * events. There is no create/update. A dispute's `status` is `open` or `won`
- * (chargeback reversed); Mollie exposes no "lost" signal, so an upheld
- * chargeback stays `open` (treat any non-`won` dispute as unresolved).
+ * Chargebacks, read-only. A dispute's `status` is `open` or `won`; the
+ * provider sends no "lost" signal, so treat any non-`won` dispute as
+ * unresolved.
  */
 export class Disputes extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/disputes/${p(id)}`);
+  retrieve<T = Dispute>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/disputes/${id}`, params, options);
   }
 
-  list<T = unknown>(params: DisputesListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/disputes", params);
+  list<T = Dispute>(
+    params: DisputesListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/disputes", params, options);
   }
 
-  iter<T = unknown>(
-    options: { pageSize?: number; status?: string; payment_id?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/disputes", page), {
-      pageSize: options.pageSize,
-      filters: { status: options.status, payment_id: options.payment_id },
-    });
+  iter<T = Dispute>(
+    params: DisputesListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, DisputesListParams>("/v1/disputes", params, options);
+  }
+}
+
+/**
+ * Test clocks: virtual time for test mode. Create a clock, create customers
+ * with `test_clock_id: clock.id`, then `advance()` it to make trials end and
+ * renewals fall due for those customers only. A live key is refused.
+ */
+export class TestClocks extends BaseResource {
+  create<T = TestClock>(params: CreateTestClockParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/test_clocks", params, options);
+  }
+
+  retrieve<T = TestClock>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/test_clocks/${id}`, params, options);
+  }
+
+  /**
+   * Move the clock forward and run everything that falls due on the way,
+   * before resolving. The idempotency key the SDK sends makes its own
+   * retries replay rather than advance twice.
+   */
+  advance<T = TestClock>(
+    id: string,
+    params: AdvanceTestClockParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(p`/v1/test_clocks/${id}/advance`, params, options);
+  }
+
+  /** Delete a clock. Its customers are kept and return to real time. */
+  delete<T = DeletedResource<"test_clock">>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.del<T>(p`/v1/test_clocks/${id}`, params, options);
+  }
+
+  list<T = TestClock>(params: BaseListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/test_clocks", params, options);
+  }
+
+  iter<T = TestClock>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/test_clocks", params, options);
   }
 }
 
 export class WebhookEndpoints extends BaseResource {
   /**
-   * Every event type this deployment can deliver, plus the wildcard.
-   *
-   * `enabled_events` rejects anything not on this list, so read it rather
-   * than hard-coding a set: a name that is not on it fails at
-   * registration and leaves you with an endpoint that never fires.
+   * Every event type an endpoint can subscribe to, plus the wildcard.
+   * `enabled_events` refuses anything not on this list.
    */
-  listEventTypes<T = unknown>(): Promise<T> {
-    return this.get<T>("/v1/webhook_endpoints/event_types");
+  listEventTypes<T = EventTypeList>(
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>("/v1/webhook_endpoints/event_types", params, options);
   }
 
-  create<T = unknown>(params: CreateWebhookEndpointParams): Promise<T> {
-    return this.post<T, CreateWebhookEndpointParams>("/v1/webhook_endpoints", params);
+  /** Register an endpoint. The response carries its signing `secret`, once. */
+  create<T = WebhookEndpoint>(
+    params: CreateWebhookEndpointParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/webhook_endpoints", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/webhook_endpoints/${p(id)}`);
+  retrieve<T = WebhookEndpoint>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/webhook_endpoints/${id}`, params, options);
   }
 
   /**
-   * Update an endpoint, or stop delivery with `status: "disabled"`.
-   *
-   * Disabling keeps the endpoint, its signing secret and its delivery
-   * history, and `status: "enabled"` resumes. Use {@link
-   * WebhookEndpoints.delete} when the endpoint should not exist at all:
-   * disabling is reversible and deleting is not.
+   * Change an endpoint, or stop delivery with `status: "disabled"`, which
+   * keeps its secret and history and is reversible. Use `delete()` when it
+   * should not exist at all.
    */
-  update<T = unknown>(id: string, params: UpdateWebhookEndpointParams): Promise<T> {
-    return this.post<T, UpdateWebhookEndpointParams>(`/v1/webhook_endpoints/${p(id)}`, params);
+  update<T = WebhookEndpoint>(
+    id: string,
+    params: UpdateWebhookEndpointParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>(p`/v1/webhook_endpoints/${id}`, params, options);
   }
 
   /**
-   * Delete an endpoint. Resolves to `{ id, object: "webhook_endpoint",
-   * deleted: true }`, not the endpoint.
-   *
-   * A URL registered by mistake should not be a permanent fixture of the
-   * account, so this removes it: `retrieve()` 404s afterwards and it is
-   * gone from `list()`. Its delivery attempts go with it, because they
-   * are readable only through the endpoint that owns them. The events
-   * themselves are untouched and still in `client.events`, so what you
-   * were sent stays on record.
+   * Delete an endpoint and its delivery attempts. The events themselves
+   * stay in `client.events`.
    */
-  delete<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.del<T>(`/v1/webhook_endpoints/${p(id)}`, params);
-  }
-
-  /** Rotate the signing secret. The new `bkwhsec_...` is returned once. */
-  rotateSecret<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/webhook_endpoints/${p(id)}/rotate_secret`, params);
-  }
-
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/webhook_endpoints", params);
-  }
-
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/webhook_endpoints", page), {
-      pageSize: options.pageSize,
-    });
+  delete<T = DeletedResource<"webhook_endpoint">>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.del<T>(p`/v1/webhook_endpoints/${id}`, params, options);
   }
 
   /**
-   * List per-attempt delivery records for one endpoint.
-   *
-   * Useful when a tenant's receiver is failing. Surfaces the status
-   * code, response body excerpt, error, and next-attempt timestamp
-   * for each event × endpoint pair.
+   * Rotate the signing secret. The new secret is returned once; the old one
+   * keeps signing alongside it for a grace period.
    */
-  listDeliveries<T = unknown>(
+  rotateSecret<T = WebhookEndpoint>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/webhook_endpoints/${id}/rotate_secret`, params, options);
+  }
+
+  list<T = WebhookEndpoint>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/webhook_endpoints", params, options);
+  }
+
+  iter<T = WebhookEndpoint>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/webhook_endpoints", params, options);
+  }
+
+  /** Per-attempt delivery records for one endpoint. */
+  listDeliveries<T = WebhookDelivery>(
     endpointId: string,
     params: BaseListParams = {},
-  ): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>(
-      `/v1/webhook_endpoints/${p(endpointId)}/deliveries`,
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>(
+      p`/v1/webhook_endpoints/${endpointId}/deliveries`,
       params,
+      options,
     );
   }
 
-  /** Walk every page of `listDeliveries()` for one endpoint. */
-  iterDeliveries<T = unknown>(
+  iterDeliveries<T = WebhookDelivery>(
     endpointId: string,
-    options: { pageSize?: number } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>(
-      (page) => this.get(`/v1/webhook_endpoints/${p(endpointId)}/deliveries`, page),
-      { pageSize: options.pageSize },
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>(
+      p`/v1/webhook_endpoints/${endpointId}/deliveries`,
+      params,
+      options,
     );
   }
 
-  /** Fetch one delivery row for inspection before deciding to redeliver. */
-  retrieveDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
-    return this.get<T>(`/v1/webhook_endpoints/${p(endpointId)}/deliveries/${p(deliveryId)}`);
-  }
-
-  /**
-   * @deprecated Renamed to {@link WebhookEndpoints.retrieveDelivery}.
-   *
-   * Every other single-row fetch in every BillKit SDK is `retrieve`; this
-   * one method was `get`, which meant reaching for the obvious name and
-   * getting a type error. The python and php clients already spell it
-   * `retrieve_delivery` / `retrieveDelivery`, so node was the outlier.
-   *
-   * Kept as an alias because removing it would break callers for a naming
-   * preference. It will go in the next major.
-   */
-  getDelivery<T = unknown>(endpointId: string, deliveryId: string): Promise<T> {
-    return this.retrieveDelivery<T>(endpointId, deliveryId);
-  }
-
-  /**
-   * Re-enqueue a delivery row for the dispatcher.
-   *
-   * Idempotent: a row already in `delivered` returns unchanged. A
-   * `pending` / `failed` row flips to `pending` with
-   * `next_attempt_at = now()`; `attempt_count` is preserved.
-   */
-  redeliver<T = unknown>(
+  retrieveDelivery<T = WebhookDelivery>(
     endpointId: string,
     deliveryId: string,
-    params: IdempotencyOptions = {},
+    params: EmptyParams = {},
+    options?: RequestOptions,
   ): Promise<T> {
-    return this.postEmpty<T>(
-      `/v1/webhook_endpoints/${p(endpointId)}/deliveries/${p(deliveryId)}/redeliver`,
+    return this.getNone<T>(
+      p`/v1/webhook_endpoints/${endpointId}/deliveries/${deliveryId}`,
       params,
+      options,
+    );
+  }
+
+  /**
+   * Queue a delivery to be sent again. A delivered row comes back
+   * unchanged; a pending or failed one is due now. `attempt_count` is kept.
+   */
+  redeliver<T = WebhookDelivery>(
+    endpointId: string,
+    deliveryId: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(
+      p`/v1/webhook_endpoints/${endpointId}/deliveries/${deliveryId}/redeliver`,
+      params,
+      options,
     );
   }
 }
 
 export class Events extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/events/${p(id)}`);
+  /**
+   * One event. `previous_attributes` is always present: `null` when there
+   * was nothing to report, the changed fields with their old values on an
+   * update.
+   */
+  retrieve<T = Event>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/events/${id}`, params, options);
   }
 
-  list<T = unknown>(params: EventsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/events", params);
+  list<T = Event>(params: EventsListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/events", params, options);
   }
 
-  /** Walk every page of `list()`. Pass `type` to filter at the server. */
-  iter<T = unknown>(
-    options: { pageSize?: number; type?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/events", page), {
-      pageSize: options.pageSize,
-      filters: { type: options.type },
-    });
+  iter<T = Event>(
+    params: EventsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, EventsListParams>("/v1/events", params, options);
   }
 }
 
-/**
- * Read + mutate tenant-level configuration.
- *
- * Exposes the Mollie capability cache, the portal-branding row, and
- * the encrypted Mollie API key. None of these are per-resource;
- * they're tenant-wide knobs.
- */
+/** Account-level configuration: capabilities, branding, seller identity, export. */
 export class Tenant extends BaseResource {
-  /** Cached Mollie profile shape (enabled methods, country, currency). */
-  capabilities<T = unknown>(): Promise<T> {
-    return this.get<T>("/v1/tenant/capabilities");
+  /** The provider capability cache: enabled methods, currencies, country. */
+  retrieveCapabilities<T = TenantCapabilities>(
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>("/v1/tenant/capabilities", params, options);
   }
 
   /**
-   * Your registered country and VAT number: what your customers' VAT is
-   * decided against.
-   *
-   * `country_code` is what you have stored and can be `null`;
-   * `effective_country_code` is what the next charge will really use.
-   * The two differ only when you have stored nothing, which is exactly
-   * the case worth spotting before a first live payment.
+   * Your registered country and VAT number. `country_code` is what you
+   * stored and can be `null`; `effective_country_code` is what the next
+   * charge will use.
    */
-  billingProfile<T = unknown>(): Promise<T> {
-    return this.get<T>("/v1/tenant/billing_profile");
+  retrieveBillingProfile<T = TenantBillingProfile>(
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>("/v1/tenant/billing_profile", params, options);
   }
 
   /**
-   * Set the seller identity. `country_code` is required on every call;
-   * every other field is partial-update, with an explicit `null` to
-   * clear. Changes take effect on the next charge only. Tax is written
-   * onto a payment and its invoice before money moves, and nothing goes
-   * back and recalculates it.
+   * Set the seller identity. Takes effect on the next charge only: tax is
+   * written onto a payment before money moves and never recalculated.
    */
-  setBillingProfile<T = unknown>(params: SetTenantBillingProfileParams): Promise<T> {
-    return this.post<T, SetTenantBillingProfileParams>("/v1/tenant/billing_profile", params);
+  setBillingProfile<T = TenantBillingProfile>(
+    params: SetTenantBillingProfileParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/tenant/billing_profile", params, options);
   }
 
   /**
-   * Download everything in the account as one JSON document, as raw bytes.
+   * Everything in the account as one JSON document, streamed. Write it to
+   * a file rather than holding it in memory:
    *
    * ```ts
-   * await writeFile("export.json", Buffer.from(await client.tenant.export()));
+   * import { createWriteStream } from "node:fs";
+   * import { Readable } from "node:stream";
+   * import { pipeline } from "node:stream/promises";
+   *
+   * const body = await client.tenant.export();
+   * await pipeline(Readable.fromWeb(body), createWriteStream("export.json"));
    * ```
    *
-   * The GDPR Article 20 portability route, and the way to take a backup.
-   * It is `application/json` streamed inline, with no redirect, and each
-   * record has the same shape its `GET` route returns, with
-   * `billkit_export_version` naming the shape. It can be large, so write
-   * it to a file rather than holding it in memory. Test and live data
-   * export separately: you get whichever mode the key belongs to. The
-   * access is recorded in your audit log.
+   * The per-attempt timeout covers the response headers only. There is no
+   * timeout once they have arrived: the body is yours to read at your own
+   * pace, so pass a `signal` (`AbortSignal.timeout(ms)`, say) to bound it.
+   * A connection lost partway through errors the stream with an
+   * `APIConnectionError`, with the runtime's own error on `cause`; an abort
+   * errors it with the signal's reason. Test and live data export
+   * separately, by the key's mode. The access is recorded in your audit log.
    */
-  export(): Promise<ArrayBuffer> {
-    return this.t.requestBinary({ method: "GET", path: "/v1/tenant/export" });
+  export(
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<ReadableStream<Uint8Array>> {
+    return this.getStream("/v1/tenant/export", params, options);
   }
 
-  /** Current portal branding row (business name, theme, capability flags). */
-  portalBranding<T = unknown>(): Promise<T> {
-    return this.get<T>("/v1/tenant/portal_branding");
+  /** The portal branding as configured, plus what customers see. */
+  retrievePortalBranding<T = TenantPortalBranding>(
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>("/v1/tenant/portal_branding", params, options);
+  }
+
+  /** Partial update: fields left `undefined` are not sent. */
+  setPortalBranding<T = TenantPortalBranding>(
+    params: SetPortalBrandingParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/tenant/portal_branding", params, options);
   }
 
   /**
-   * Partial-update the portal branding row.
-   *
-   * Only fields you set are sent. Pass `undefined` to leave a field
-   * untouched; sending an empty string explicitly clears it.
+   * Replace the encrypted provider credential. A key whose prefix does not
+   * match `mode` (`test_` under live, say) is refused.
    */
-  setPortalBranding<T = unknown>(params: SetPortalBrandingParams = {}): Promise<T> {
-    return this.post<T, SetPortalBrandingParams>("/v1/tenant/portal_branding", params);
-  }
-
-  /**
-   * Rotate the encrypted provider credential for this tenant.
-   *
-   * The new `api_key` is encrypted server-side; nothing is logged.
-   * `mode` defaults to the calling key's mode; prefix-mismatch
-   * (`test_...` under live, `live_...` under test) is rejected at the
-   * API boundary.
-   */
-  rotateProviderCredential<T = unknown>(params: RotateProviderCredentialParams): Promise<T> {
-    return this.post<T, RotateProviderCredentialParams>(
-      "/v1/tenant/provider_credential",
-      params,
-    );
+  rotateProviderCredential<T = TenantProviderCredential>(
+    params: RotateProviderCredentialParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/tenant/provider_credential", params, options);
   }
 }
 
 export class Coupons extends BaseResource {
-  create<T = unknown>(params: CreateCouponParams): Promise<T> {
-    return this.post<T, CreateCouponParams>("/v1/coupons", params);
+  /** Exactly one of `percent_off` and `amount_off_cents`. */
+  create<T = Coupon>(params: CreateCouponParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/coupons", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/coupons/${p(id)}`);
-  }
-
-  /**
-   * Update a coupon's limits, or withdraw it with `active: false`.
-   *
-   * A withdrawn code is refused at checkout while the coupon stays
-   * readable and discounts already applied keep working out, so there is
-   * no `delete()`: a coupon that has been redeemed is part of what a
-   * customer was charged. `active: true` brings the campaign back.
-   */
-  update<T = unknown>(id: string, params: UpdateCouponParams): Promise<T> {
-    return this.post<T, UpdateCouponParams>(`/v1/coupons/${p(id)}`, params);
+  retrieve<T = Coupon>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/coupons/${id}`, params, options);
   }
 
   /**
-   * Server-side dry-run of a coupon redemption.
-   *
-   * Returns the discount math without atomically claiming the coupon,
-   * which is useful for "preview before checkout" UX.
+   * Change a coupon's limits, or withdraw it with `active: false`. A
+   * withdrawn code is refused at checkout; discounts already applied keep
+   * running.
    */
-  validate<T = unknown>(params: ValidateCouponParams): Promise<T> {
-    // Omit the optional fields rather than sending explicit nulls, so the
-    // request body matches what a caller who only has a code would hand
-    // written by hand, and so `extra="forbid"` schemas stay happy.
-    const body: Record<string, unknown> = { code: params.code };
-    if (params.price_id !== undefined) body["price_id"] = params.price_id;
-    if (params.amount_cents !== undefined) body["amount_cents"] = params.amount_cents;
-    return this.postFixed<T>("/v1/coupons/validate", body);
+  update<T = Coupon>(id: string, params: UpdateCouponParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>(p`/v1/coupons/${id}`, params, options);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/coupons", params);
+  /** A dry run of a redemption: the discount math, nothing claimed. */
+  validate<T = CouponValidation>(
+    params: ValidateCouponParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/coupons/validate", params, options);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/coupons", page), { pageSize: options.pageSize });
+  list<T = Coupon>(params: BaseListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/coupons", params, options);
+  }
+
+  iter<T = Coupon>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/coupons", params, options);
   }
 }
 
 export class TaxRates extends BaseResource {
-  create<T = unknown>(params: CreateTaxRateParams): Promise<T> {
-    return this.post<T, CreateTaxRateParams>("/v1/tax_rates", params);
+  create<T = TaxRate>(params: CreateTaxRateParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/tax_rates", params, options);
   }
 
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/tax_rates/${p(id)}`);
+  retrieve<T = TaxRate>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/tax_rates/${id}`, params, options);
   }
 
   /**
-   * Correct a rate, retire it with `active: false`, or bring one back.
-   *
-   * Retiring is how you stop charging VAT in a country. The rate stays
-   * readable, because an invoice records the percentage it charged and
-   * you have to be able to point at the rate that produced it, so there
-   * is no `delete()`.
+   * Correct a rate, retire it with `active: false`, or bring one back. A
+   * retired rate stays readable: an invoice records the rate it charged.
    */
-  update<T = unknown>(id: string, params: UpdateTaxRateParams): Promise<T> {
-    return this.post<T, UpdateTaxRateParams>(`/v1/tax_rates/${p(id)}`, params);
+  update<T = TaxRate>(id: string, params: UpdateTaxRateParams, options?: RequestOptions): Promise<T> {
+    return this.post<T>(p`/v1/tax_rates/${id}`, params, options);
   }
 
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/tax_rates", params);
+  list<T = TaxRate>(params: BaseListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/tax_rates", params, options);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/tax_rates", page), { pageSize: options.pageSize });
+  iter<T = TaxRate>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/tax_rates", params, options);
   }
 }
 
-/**
- * Read-only access to generated invoices.
- *
- * Invoices are produced by the billing pipeline; tenants don't create
- * them directly. Fetch the rendered document with
- * {@link Invoices.retrievePdf}.
- */
+/** Invoices, produced by the billing pipeline. There is no create. */
 export class Invoices extends BaseResource {
   /** Expandable: `customer`. */
-  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
-    return this.get<T>(`/v1/invoices/${p(id)}`, options);
+  retrieve<T = Invoice>(
+    id: string,
+    params: RetrieveParams<"customer"> = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.get<T>(p`/v1/invoices/${id}`, params, options);
   }
 
   /**
-   * Download the rendered invoice PDF as raw bytes.
+   * The rendered PDF, as bytes.
    *
    * ```ts
-   * const pdf = await client.invoices.retrievePdf("inv_123");
-   * await writeFile("invoice.pdf", Buffer.from(pdf));
+   * await writeFile("invoice.pdf", Buffer.from(await client.invoices.retrievePdf(id)));
    * ```
    *
-   * Blob-backed deployments stream the bytes inline; S3-backed ones
-   * answer `302` to a presigned URL, which `fetch` follows for us under
-   * the SDK's own timeout and retry policy — so both storage adapters
-   * look identical from here.
-   *
-   * Deployments with `INVOICE_PDF_ENABLED=false` never render one and
-   * answer `501 rendering_pending`, which surfaces as a `ServerError`
-   * whose `code` is `"rendering_pending"`; `retrieve()` still returns the
-   * structured invoice for tenants who render their own.
+   * A deployment that renders no PDFs answers `501 rendering_pending`, a
+   * `ServerError` with that `code`.
    */
-  retrievePdf(id: string): Promise<ArrayBuffer> {
-    return this.t.requestBinary({ method: "GET", path: `/v1/invoices/${p(id)}/pdf` });
+  retrievePdf(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<ArrayBuffer> {
+    return this.getBinary(p`/v1/invoices/${id}/pdf`, params, options);
   }
 
   /**
-   * Send the customer their invoice again.
-   *
-   * The same tenant-branded "your invoice is ready" email, with a fresh
-   * portal link, because the one in the original may have expired. It
-   * goes to the address captured **on the invoice**, not the customer's
-   * current one: this is a copy of a document that was issued to
-   * somebody. An invoice with no address on file is a
-   * `InvalidRequestError` rather than a send that did not happen.
+   * Email the invoice to the address captured **on the invoice**, with a
+   * fresh portal link. An invoice with no address on file is refused.
    */
-  sendEmail<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/invoices/${p(id)}/email`, params);
+  sendEmail<T = InvoiceEmailResult>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/invoices/${id}/email`, params, options);
   }
 
-  list<T = unknown>(params: InvoicesListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/invoices", params);
+  list<T = Invoice>(
+    params: InvoicesListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/invoices", params, options);
   }
 
-  iter<T = unknown>(
-    options: {
-      pageSize?: number;
-      customer_id?: string;
-      subscription_id?: string;
-      payment_id?: string;
-      status?: string;
-    } = {},
-  ): AsyncIterableIterator<T> {
-    const { pageSize, ...filters } = options;
-    return paginate<T>((page) => this.get("/v1/invoices", page), { pageSize, filters });
+  iter<T = Invoice>(
+    params: InvoicesListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, InvoicesListParams>("/v1/invoices", params, options);
   }
 
   /**
-   * Void an invoice: state that the sale was never owed.
-   *
-   * The invoice keeps its number and stays readable — a gapless series
-   * cannot lose a row — and stops being a receivable. Use it for an
-   * invoice that should not have been issued.
-   *
-   * A **paid** invoice is refused with a `ConflictError` whose `code` is
-   * `"invoice_not_voidable"`. That is deliberate rather than a
-   * limitation: once the money has moved, "never owed" is false, and the
-   * document that reverses a real sale is a credit note — refund the
-   * payment and one is issued when the refund settles.
-   *
-   * Idempotent: re-voiding an already-void invoice returns it unchanged.
+   * State that the sale was never owed. The invoice keeps its number and
+   * stays readable. A **paid** invoice is refused (`ConflictError`, code
+   * `invoice_not_voidable`): refund it, and a credit note is issued when the
+   * refund settles. Re-voiding returns it unchanged.
    */
-  void<T = unknown>(id: string, params: VoidInvoiceParams = {}): Promise<T> {
-    return this.post<T, VoidInvoiceParams>(`/v1/invoices/${p(id)}/void`, params);
+  void<T = Invoice>(id: string, params: VoidInvoiceParams = {}, options?: RequestOptions): Promise<T> {
+    return this.post<T>(p`/v1/invoices/${id}/void`, params, options);
   }
 }
 
 /**
- * Read-only access to credit notes — the documents that reverse an
- * issued invoice.
- *
- * There is no create: a credit note is issued for you when a refund
- * settles, never on request, so that a numbered legal record is only
- * minted once the money has actually moved. A refund that is still
- * pending, one that fails, and a refund of a one-off charge that was
- * never invoiced all produce none.
+ * Credit notes, the documents that reverse an invoice. Issued for you when
+ * a refund settles, never on request.
  */
 export class CreditNotes extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/credit_notes/${p(id)}`);
+  retrieve<T = CreditNote>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/credit_notes/${id}`, params, options);
   }
 
-  /**
-   * Download the rendered credit note PDF as raw bytes. Same storage
-   * split as {@link Invoices.retrievePdf}: bytes inline or a followed
-   * `302`, and `501 rendering_pending` on a deployment with no renderer.
-   */
-  retrievePdf(id: string): Promise<ArrayBuffer> {
-    return this.t.requestBinary({ method: "GET", path: `/v1/credit_notes/${p(id)}/pdf` });
+  /** The rendered PDF, as bytes. Same storage split as `invoices.retrievePdf`. */
+  retrievePdf(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<ArrayBuffer> {
+    return this.getBinary(p`/v1/credit_notes/${id}/pdf`, params, options);
   }
 
-  list<T = unknown>(params: CreditNotesListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/credit_notes", params);
+  list<T = CreditNote>(
+    params: CreditNotesListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/credit_notes", params, options);
   }
 
-  iter<T = unknown>(
-    options: { pageSize?: number; invoice_id?: string; customer_id?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/credit_notes", page), {
-      pageSize: options.pageSize,
-      filters: { invoice_id: options.invoice_id, customer_id: options.customer_id },
-    });
+  iter<T = CreditNote>(
+    params: CreditNotesListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, CreditNotesListParams>("/v1/credit_notes", params, options);
   }
 }
 
-/**
- * Read-only access to the per-tenant audit log.
- *
- * Supports server-side filters: `action`, `resource_type`, `actor_id`.
- * The filters are forwarded through to `iter()` so an audit walk can
- * scope to a single actor or action without client-side filtering.
- */
+/** The account's audit log, read-only. */
 export class AuditLogs extends BaseResource {
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/audit_logs/${p(id)}`);
+  retrieve<T = AuditLog>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/audit_logs/${id}`, params, options);
   }
 
-  list<T = unknown>(params: AuditLogsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/audit_logs", params);
+  list<T = AuditLog>(
+    params: AuditLogsListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/audit_logs", params, options);
   }
 
-  iter<T = unknown>(
-    options: {
-      pageSize?: number;
-      action?: string;
-      resource_type?: string;
-      resource_id?: string;
-      actor_id?: string;
-    } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/audit_logs", page), {
-      pageSize: options.pageSize,
-      filters: {
-        action: options.action,
-        resource_type: options.resource_type,
-        resource_id: options.resource_id,
-        actor_id: options.actor_id,
-      },
-    });
+  iter<T = AuditLog>(
+    params: AuditLogsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, AuditLogsListParams>("/v1/audit_logs", params, options);
   }
 }
 
-/**
- * Read-only access to the payment ledger.
- *
- * Payments are written by the billing pipeline (checkout, renewal,
- * reauthorize). Inspect attempts and their Mollie-side metadata here;
- * refunds and disputes are separate flows.
- */
+/** Subscription payments, read-only. One-off charges are `oneShotPayments`. */
 export class Payments extends BaseResource {
   /**
-   * Expandable: `customer`, `subscription`, `refund_eligibility`. The last
-   * is retrieve-only (`list` refuses it with a `400`) and attaches
-   * `refund_eligibility: { object: "refund_eligibility", eligible,
-   * amount_cents, currency, days_remaining, window_ends_at, reason }`:
-   * whether `refunds.create` for the remaining balance would succeed now,
-   * applying the refund window and the price's refund policy, which
-   * `amount_refundable_cents` does not. When `eligible` is false, `reason`
-   * is one of `not_paid`, `unrefundable_type`, `window_expired`,
-   * `fully_refunded`, `disputed`, `operation_pending` or
-   * `plan_change_pending` (a plan change is settling: the full balance
-   * cannot be refunded yet, a partial refund still can); treat any other
-   * value as "not refundable".
+   * Expandable: `customer`, `subscription`, and, on retrieve only,
+   * `refund_eligibility`: whether `refunds.create` for the remaining
+   * balance would succeed now. When `eligible` is false, treat any `reason`
+   * you do not recognise as "not refundable".
    */
-  retrieve<T = unknown>(id: string, options: ExpandOptions = {}): Promise<T> {
-    return this.get<T>(`/v1/payments/${p(id)}`, options);
+  retrieve<T = Payment>(
+    id: string,
+    params: RetrieveParams<"customer" | "subscription" | "refund_eligibility"> = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.get<T>(p`/v1/payments/${id}`, params, options);
   }
 
   /**
-   * Fetch the provider's own record of this charge, live.
-   *
-   * Reads Mollie at request time rather than a stored copy, so it carries
-   * what BillKit deliberately does not keep: the card BIN, the iDEAL
-   * bank, the provider's own status string. Reading live means it can
-   * fail: a provider outage or a charge old enough to have aged out
-   * answers `200` with `available: false` and a short reason, so render
-   * the rest of the page regardless.
+   * The provider's own record of this charge, read live. A provider outage
+   * or an aged-out charge answers `200` with `available: false`.
    */
-  retrieveProvider<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/payments/${p(id)}/provider`);
+  retrieveProvider<T = ProviderPayload>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/payments/${id}/provider`, params, options);
   }
 
-  list<T = unknown>(params: PaymentsListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/payments", params);
+  list<T = Payment>(
+    params: PaymentsListParams = {},
+    options?: RequestOptions,
+  ): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/payments", params, options);
   }
 
-  iter<T = unknown>(
-    options: { pageSize?: number; customer_id?: string } = {},
-  ): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/payments", page), {
-      pageSize: options.pageSize,
-      filters: { customer_id: options.customer_id },
-    });
+  iter<T = Payment>(
+    params: PaymentsListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, PaymentsListParams>("/v1/payments", params, options);
   }
 }
 
 /**
- * Mint and revoke customer-facing billing-portal sessions.
- *
- * Each session token is scoped to a single subscription with a
- * sliding 30-minute idle window and a 2-hour hard cap. The raw token
- * is returned **once** on mint; the response also includes the URL
- * the tenant embeds in their app.
+ * Customer-facing billing portal sessions, each scoped to one subscription
+ * with a 30-minute idle window and a 2-hour cap. The token is returned once.
  */
 export class BillingPortalSessions extends BaseResource {
-  create<T = unknown>(params: CreateBillingPortalSessionParams): Promise<T> {
-    return this.post<T, CreateBillingPortalSessionParams>("/v1/billing_portal/sessions", params);
+  create<T = BillingPortalSession>(
+    params: CreateBillingPortalSessionParams,
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.post<T>("/v1/billing_portal/sessions", params, options);
   }
 
-  /** Kill an in-the-wild portal session. Idempotent. */
-  revoke<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/billing_portal/sessions/${p(id)}/revoke`, params);
+  /** End a session now. Idempotent. */
+  revoke<T = BillingPortalSessionRevocation>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/billing_portal/sessions/${id}/revoke`, params, options);
   }
 }
 
 /**
- * Issue, inspect and revoke API keys.
- *
- * A key is issued in the same mode as the key that created it, so a test
- * key can only mint test keys, and it can never grant scopes it does not
- * hold itself. The secret is returned **once**, on
- * {@link ApiKeys.create}; every later read carries only the prefix.
+ * API keys. A key is minted in its creator's mode and never with more
+ * scopes than its creator holds. The secret is returned once, by `create`.
  */
 export class ApiKeys extends BaseResource {
-  /**
-   * Issue a new key. The response's `secret` is the only time the full
-   * key exists outside the caller's own storage, so record it now.
-   */
-  create<T = unknown>(params: CreateApiKeyParams = {}): Promise<T> {
-    return this.post<T, CreateApiKeyParams>("/v1/api_keys", params);
+  create<T = ApiKey>(params: CreateApiKeyParams = {}, options?: RequestOptions): Promise<T> {
+    return this.post<T>("/v1/api_keys", params, options);
   }
 
-  /**
-   * One key's metadata: prefix, label, scopes, `revoked_at`, and
-   * `last_used_at`, which is the field to read before revoking one.
-   */
-  retrieve<T = unknown>(id: string): Promise<T> {
-    return this.get<T>(`/v1/api_keys/${p(id)}`);
+  /** Metadata only: prefix, label, scopes, `revoked_at`, `last_used_at`. */
+  retrieve<T = ApiKey>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.getNone<T>(p`/v1/api_keys/${id}`, params, options);
   }
 
-  /**
-   * Revoke a key so it stops working. Immediate and irreversible; issue a
-   * new key instead. Revoking an already-revoked key returns it
-   * unchanged, so a retry is safe, and a key may revoke itself, which is
-   * what you want when the leaked key is the one you are calling with.
-   */
-  revoke<T = unknown>(id: string, params: IdempotencyOptions = {}): Promise<T> {
-    return this.postEmpty<T>(`/v1/api_keys/${p(id)}/revoke`, params);
+  /** Immediate and irreversible. Revoking a revoked key returns it unchanged. */
+  revoke<T = ApiKey>(
+    id: string,
+    params: EmptyParams = {},
+    options?: RequestOptions,
+  ): Promise<T> {
+    return this.postNone<T>(p`/v1/api_keys/${id}/revoke`, params, options);
   }
 
-  /** List keys, newest first. Revoked ones are included; check `revoked_at`. */
-  list<T = unknown>(params: BaseListParams = {}): Promise<ListResponseEnvelope<T>> {
-    return this.get<ListResponseEnvelope<T>>("/v1/api_keys", params);
+  /** Newest first, revoked keys included. */
+  list<T = ApiKey>(params: BaseListParams = {}, options?: RequestOptions): Promise<ListResponse<T>> {
+    return this.get<ListResponse<T>>("/v1/api_keys", params, options);
   }
 
-  iter<T = unknown>(options: { pageSize?: number } = {}): AsyncIterableIterator<T> {
-    return paginate<T>((page) => this.get("/v1/api_keys", page), { pageSize: options.pageSize });
+  iter<T = ApiKey>(
+    params: BaseListParams = {},
+    options?: RequestOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    return this.iterate<T, BaseListParams>("/v1/api_keys", params, options);
   }
 }

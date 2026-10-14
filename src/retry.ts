@@ -11,6 +11,7 @@
  */
 
 export interface RetryPolicy {
+  /** Attempts in total, the first included. `maxRetries` on the client or a call overrides it. */
   readonly maxAttempts: number;
   readonly initialBackoffMs: number;
   readonly backoffMultiplier: number;
@@ -47,8 +48,8 @@ export function backoffForMs(attempt: number, policy: RetryPolicy): number {
  * `Idempotency-Key` is still in flight ("Retry after a short delay",
  * `Retry-After: 1`). It is the only 4xx where doing nothing is the
  * dangerous option: the call may well have charged the customer, the
- * caller cannot see the outcome, and the obvious workaround — retry
- * with a *fresh* key — is precisely what turns one charge into two.
+ * caller cannot see the outcome, and the obvious workaround (retry
+ * with a *fresh* key) is precisely what turns one charge into two.
  *
  * Retrying is safe because the transport reuses the original
  * `Idempotency-Key` on every attempt, so the retry either loses the
@@ -81,9 +82,30 @@ export function shouldRetry(
     if (retryAfterMs === undefined || retryAfterMs < 0) return false;
     return policy.maxRetryAfterMs === undefined || retryAfterMs <= policy.maxRetryAfterMs;
   }
-  return status >= 500;
+  // 501 Not Implemented is a permanent answer about the route, not a fault
+  // that clears on its own; every other 5xx is worth another attempt.
+  return status >= 500 && status !== 501;
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Wait `ms` between attempts. A caller's `signal` cuts the wait short and
+ * rejects with its reason, so an aborted call does not sit out a backoff
+ * it will never use.
+ */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(handle);
+      reject(signal?.reason);
+    };
+    const handle = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
