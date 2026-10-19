@@ -292,6 +292,12 @@ export async function callShapes(): Promise<void> {
     // @ts-expect-error: a decimal rate is a string, never a number.
     unit_amount_decimal: 0.02,
   });
+
+  // A price says whether it follows the account's methods, and an update
+  // takes null to make it follow them again.
+  const price = await client.prices.update("price_1", { payment_methods: null });
+  const fromAccount: boolean | undefined = price.payment_methods_from_account;
+  void fromAccount;
 }
 
 // iter() takes exactly what list() takes.

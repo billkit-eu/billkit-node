@@ -1170,6 +1170,23 @@ describe("bodies that must not be pruned", () => {
     });
   });
 
+  it("prices.create without payment_methods sends no key, so the price follows the account", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await client(fetchImpl).prices.create({
+      product_id: "prod_1",
+      amount_cents: 1000,
+      interval: "month",
+    });
+    const body = JSON.parse(calls[0]?.body ?? "{}");
+    expect(body).not.toHaveProperty("payment_methods");
+  });
+
+  it("prices.update with payment_methods: null sends JSON null to follow the account", async () => {
+    const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "price_1" } }]);
+    await client(fetchImpl).prices.update("price_1", { payment_methods: null });
+    expect(calls[0]?.body).toBe('{"payment_methods":null}');
+  });
+
   it("checkoutSessions.create carries country", async () => {
     const { fetchImpl, calls } = makeMockFetch([{ status: 200, body: { id: "cs_1" } }]);
     await client(fetchImpl).checkoutSessions.create({
@@ -1271,6 +1288,13 @@ describe("Nullable update fields: explicit null clears", () => {
       path: "/v1/prices/price_1",
       field: "refund_window_initial_days",
       value: 14,
+      call: (c, b) => c.prices.update("price_1", b as UpdatePriceParams),
+    },
+    {
+      name: "prices.update payment_methods",
+      path: "/v1/prices/price_1",
+      field: "payment_methods",
+      value: ["creditcard", "ideal"],
       call: (c, b) => c.prices.update("price_1", b as UpdatePriceParams),
     },
     {

@@ -369,6 +369,13 @@ export interface CreatePriceParams {
   metadata?: Record<string, string> | null | undefined;
   trial_days?: number | null | undefined;
   trial_verification_cents?: number | null | undefined;
+  /**
+   * The methods a checkout may offer for this price, overriding the
+   * account's. Leave it out (or send `null`) to follow the account: the price
+   * then offers every method switched on in Mollie and not switched off in
+   * the workspace's settings, and `payment_methods_from_account` reads
+   * `true` on the response.
+   */
   payment_methods?: RecurringPaymentMethod[] | null | undefined;
   /**
    * What a cancellation refunds without being asked: `"none"` (default),
@@ -402,15 +409,19 @@ export interface CreatePriceParams {
  * `prices.update`. `amount_cents`, `currency`, `interval` and `usage_type`
  * decide what a past charge was, so they are fixed at creation; what is
  * here decides what happens next. `tax_behavior` can be set once, while
- * the price is still `"unspecified"`. Only the two refund windows accept
- * `null`, which clears the override.
+ * the price is still `"unspecified"`. Only `payment_methods` and the two
+ * refund windows accept `null`, which clears the override.
  */
 export interface UpdatePriceParams {
   /** `false` withdraws the price from sale; `true` puts it back. */
   active?: boolean | undefined;
   metadata?: Record<string, string> | undefined;
   tax_behavior?: "inclusive" | "exclusive" | undefined;
-  payment_methods?: RecurringPaymentMethod[] | undefined;
+  /**
+   * A list gives the price its own methods; `null` drops that list so the
+   * price follows the account's methods again. Omitted leaves it unchanged.
+   */
+  payment_methods?: RecurringPaymentMethod[] | null | undefined;
   refund_on_cancel?: "none" | "full" | "prorated" | undefined;
   refund_window_initial_days?: number | null | undefined;
   refund_window_renewal_days?: number | null | undefined;
@@ -657,6 +668,8 @@ export interface SetTenantBillingProfileParams {
   postal_code?: string | null | undefined;
   city?: string | null | undefined;
   registration_number?: string | null | undefined;
+  /** The registered legal name printed on BillKit's invoices to you. `null` clears it. */
+  legal_name?: string | null | undefined;
 }
 
 export interface RotateProviderCredentialParams {

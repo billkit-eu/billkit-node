@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Versioning is independent of the Python SDK; the two ship on their own cadence,
 so the numbers will diverge after this first release.
 
+## [Unreleased]
+
+## [1.1.0] - 2026-10-19
+
+### Added
+
+- `Price` and `ExpandedPrice` carry `payment_methods_from_account`: `true`
+  when the price follows the account's payment methods, `false` when it has
+  its own list. When it is `true`, `payment_methods` lists the account's
+  methods (every recurring method the workspace has not switched off).
+- `UpdatePriceParams.payment_methods` accepts `null`, sent as a JSON null,
+  which drops the price's own list so it follows the account again. Omitting
+  the key still leaves it unchanged.
+- Generated from API contract 1.1.0: the audit log `action` vocabulary gains
+  `tenant.test_mode_email_enabled`, `tenant.test_mode_email_disabled`,
+  `tenant.invoice_pdf_attach_enabled`, `tenant.invoice_pdf_attach_disabled`
+  and `tenant.payment_methods_updated`.
+
+### Changed
+
+- A price created without `payment_methods` now follows the account's
+  payment methods instead of defaulting to `["creditcard"]` (an API change in
+  contract 1.1.0; the SDK never sent a default and still sends no key).
+- Every property on the generated model and request types carries the API
+  reference's description as a JSDoc comment, so an editor shows what a field
+  means. No type or behaviour changed.
+
 ## [1.0.0] - 2026-10-14
 
 The first stable release. From here on the package follows semantic

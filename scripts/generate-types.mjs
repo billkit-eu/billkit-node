@@ -416,7 +416,10 @@ export function generate(spec) {
   for (const name of Object.keys(schemas)) {
     if (!requestNames.includes(name)) continue;
     const decl = declaration(name, schemas[name], "request");
-    for (const match of decl.matchAll(/\b([A-Z][A-Za-z0-9]*)\b/g)) {
+    // Scan the code only: a JSDoc comment is prose, and a description that
+    // says "Payment" is not a reference to the Payment model.
+    const code = decl.replace(/\/\*\*[\s\S]*?\*\//g, "");
+    for (const match of code.matchAll(/\b([A-Z][A-Za-z0-9]*)\b/g)) {
       const candidate = match[1];
       for (const modelName of modelNames) {
         if (typeName(modelName) === candidate) usedModels.add(candidate);
