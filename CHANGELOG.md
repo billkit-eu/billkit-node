@@ -10,6 +10,14 @@ so the numbers will diverge after this first release.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-19
+
+### Changed
+- Generated types regenerated against the current public spec: the
+  `stripe_import.connected`, `stripe_import.started` and
+  `subscription.imported` audit actions and the `import_not_activated`
+  cancellation reason.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added
